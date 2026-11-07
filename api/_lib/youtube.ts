@@ -51,13 +51,19 @@ function pickThumb(info: {
   return id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : null
 }
 
+const CLIENTS = ['ANDROID', 'IOS', 'TV', 'WEB'] as const
+
 async function getInfo(videoId: string) {
   const tube = await getTube()
-  try {
-    return await tube.getBasicInfo(videoId, { client: 'ANDROID' })
-  } catch {
-    return tube.getBasicInfo(videoId, { client: 'WEB' })
+  let lastErr: unknown
+  for (const client of CLIENTS) {
+    try {
+      return await tube.getBasicInfo(videoId, { client })
+    } catch (err) {
+      lastErr = err
+    }
   }
+  throw lastErr instanceof Error ? lastErr : new Error('Failed to load YouTube info')
 }
 
 export async function resolveYoutube(sourceUrl: string): Promise<ResolvedMedia> {
@@ -98,6 +104,25 @@ function videoQualityLabel(height: number): string {
   return '480p'
 }
 
+export function youtubeOutputHints(
+  meta: ResolvedMedia,
+  opts: { kind: 'audio' | 'video'; quality: number },
+): { mimeType: string; filename: string; needsEncode: boolean } {
+  const base = sanitizeFilename(meta.title)
+  if (opts.kind === 'audio') {
+    return {
+      mimeType: 'audio/mp4',
+      filename: `${base}.m4a`,
+      needsEncode: true,
+    }
+  }
+  return {
+    mimeType: 'video/mp4',
+    filename: `${base}.mp4`,
+    needsEncode: false,
+  }
+}
+
 export async function pickYoutubeFormat(
   sourceUrl: string,
   opts: { kind: 'audio' | 'video'; quality: number },
@@ -108,11 +133,31 @@ export async function pickYoutubeFormat(
   const format = info.chooseFormat({
     type: opts.kind === 'audio' ? 'audio' : 'video+audio',
     quality: opts.kind === 'audio' ? 'best' : videoQualityLabel(opts.quality),
-    format: opts.kind === 'audio' ? 'any' : 'mp4',
+    format: 'any',
   })
 
-  const mediaUrl = await format.decipher(info.actions.session.player)
-  if (!mediaUrl) throw new Error('Could not decipher stream URL')
+  let mediaUrl = format.url || ''
+  if (!mediaUrl) {
+    try {
+      mediaUrl = await format.decipher(info.actions.session.player)
+    } catch {
+      mediaUrl = ''
+    }
+  }
+  if (!mediaUrl) {
+    // Last resort: streaming data helper
+    try {
+      const data = await info.getStreamingInfo()
+      const list =
+        opts.kind === 'audio'
+          ? data.audio_sets?.flatMap((s) => s.representationss || []) || []
+          : []
+      void list
+    } catch {
+      // ignore
+    }
+    throw new Error('No valid URL to decipher — try again or set YT_COOKIE')
+  }
 
   const ext =
     opts.kind === 'audio'
@@ -139,25 +184,30 @@ export async function downloadYoutubeStream(
 ): Promise<{ stream: ReadableStream<Uint8Array>; mimeType: string; filename: string; title: string }> {
   const meta = await resolveYoutube(sourceUrl)
   const tube = await getTube()
+  const hints = youtubeOutputHints(meta, opts)
 
-  try {
-    const stream = await tube.download(meta.videoId, {
-      type: opts.kind === 'audio' ? 'audio' : 'video+audio',
-      quality: opts.kind === 'audio' ? 'best' : videoQualityLabel(opts.quality),
-      format: opts.kind === 'audio' ? 'any' : 'mp4',
-      client: 'ANDROID',
-    })
-    const picked = await pickYoutubeFormat(sourceUrl, opts).catch(() => null)
-    return {
-      stream,
-      mimeType: picked?.mimeType || (opts.kind === 'audio' ? 'audio/mp4' : 'video/mp4'),
-      filename:
-        picked?.filename ||
-        `${sanitizeFilename(meta.title)}.${opts.kind === 'audio' ? 'm4a' : 'mp4'}`,
-      title: meta.title,
+  let lastErr: unknown
+  for (const client of CLIENTS) {
+    try {
+      const stream = await tube.download(meta.videoId, {
+        type: opts.kind === 'audio' ? 'audio' : 'video+audio',
+        quality: opts.kind === 'audio' ? 'best' : videoQualityLabel(opts.quality),
+        format: 'any',
+        client,
+      })
+      return {
+        stream,
+        mimeType: hints.mimeType,
+        filename: hints.filename,
+        title: meta.title,
+      }
+    } catch (err) {
+      lastErr = err
     }
-  } catch {
-    // Fallback: proxy the deciphered CDN URL directly
+  }
+
+  // Fallback: direct CDN URL when download() fails
+  try {
     const picked = await pickYoutubeFormat(sourceUrl, opts)
     const res = await fetch(picked.mediaUrl, {
       headers: {
@@ -175,5 +225,13 @@ export async function downloadYoutubeStream(
       filename: picked.filename,
       title: picked.title,
     }
+  } catch (err) {
+    const msg =
+      err instanceof Error
+        ? err.message
+        : lastErr instanceof Error
+          ? lastErr.message
+          : 'YouTube download failed'
+    throw new Error(msg)
   }
 }

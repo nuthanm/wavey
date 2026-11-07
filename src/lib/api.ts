@@ -21,19 +21,49 @@ export type ResolveError = {
   error: string
 }
 
+async function readJsonSafe(res: Response): Promise<unknown> {
+  const text = await res.text()
+  if (!text.trim()) {
+    throw new Error(
+      res.ok
+        ? 'Empty response from API'
+        : `API unavailable (${res.status}). Run npm run dev so the local API starts on port 8787.`,
+    )
+  }
+  try {
+    return JSON.parse(text) as unknown
+  } catch {
+    throw new Error(
+      `API returned non-JSON (${res.status}). Is the Wavey API running? Use npm run dev (UI + API).`,
+    )
+  }
+}
+
 export async function resolveMedia(input: {
   url: string
   output: 'mp3' | 'mp4'
   quality: number
 }): Promise<ResolveResponse> {
-  const res = await fetch('/api/resolve', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(input),
-  })
-  const data = (await res.json()) as ResolveResponse | ResolveError
-  if (!res.ok || !data.ok) {
-    throw new Error(!data.ok ? data.error : `Resolve failed (${res.status})`)
+  let res: Response
+  try {
+    res = await fetch('/api/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+  } catch {
+    throw new Error(
+      'Cannot reach /api/resolve. Start the app with npm run dev (starts UI + local API).',
+    )
+  }
+
+  const data = (await readJsonSafe(res)) as ResolveResponse | ResolveError
+  if (!res.ok || !data || typeof data !== 'object' || !('ok' in data) || !data.ok) {
+    const message =
+      data && typeof data === 'object' && 'error' in data && typeof data.error === 'string'
+        ? data.error
+        : `Resolve failed (${res.status})`
+    throw new Error(message)
   }
   return data
 }
@@ -46,14 +76,20 @@ export async function downloadWithProgress(
   token: string,
   onProgress: (pct: number) => void,
 ): Promise<{ blob: Blob; contentType: string }> {
-  const res = await fetch(streamUrl(token))
+  let res: Response
+  try {
+    res = await fetch(streamUrl(token))
+  } catch {
+    throw new Error('Cannot reach /api/stream. Is npm run dev still running?')
+  }
+
   if (!res.ok) {
     let message = `Download failed (${res.status})`
     try {
-      const err = (await res.json()) as { error?: string }
+      const err = (await readJsonSafe(res)) as { error?: string }
       if (err.error) message = err.error
-    } catch {
-      // ignore
+    } catch (e) {
+      if (e instanceof Error && !e.message.startsWith('Download')) message = e.message
     }
     throw new Error(message)
   }

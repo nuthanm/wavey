@@ -90,11 +90,10 @@ Install these before running locally:
 | --- | --- | --- |
 | [Node.js](https://nodejs.org/) | **20+** (LTS recommended) | Includes `npm` |
 | [Git](https://git-scm.com/) | Any recent | Clone / push |
-| [Vercel CLI](https://vercel.com/docs/cli) | Latest | Required for full local API (`npm run dev:full`) |
 
 Optional:
 
-- A [Vercel](https://vercel.com/) account (deploy + `vercel dev` login)
+- [Vercel CLI](https://vercel.com/docs/cli) + account — deploy, or `npm run dev:full`
 - Instagram session cookie only if you need **stories**
 
 ---
@@ -140,27 +139,22 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
 > `.env.local` is gitignored. Never commit secrets.
 
-### 4. Run the full stack (UI + API)
-
-```bash
-npm run dev:full
-```
-
-This runs `vercel dev`, which serves the Vite app **and** `/api/resolve`, `/api/stream`, `/api/health`.
-
-Open the URL printed in the terminal (often `http://localhost:3000`).
-
-### 5. UI-only mode (optional)
-
-If you only need the frontend while iterating on styles:
+### 4. Run locally (UI + API)
 
 ```bash
 npm run dev
 ```
 
-Vite usually starts at `http://localhost:5173`. API calls proxy to `http://127.0.0.1:3000` — so keep `npm run dev:full` (or another API on 3000) running if you want resolve/download to work.
+This starts:
 
-### 6. Production build check
+- **API** on `http://127.0.0.1:8787` (`scripts/local-api.ts`)
+- **Web UI** on `http://localhost:5173` (Vite proxies `/api` → the local API)
+
+Open **http://localhost:5173** in your browser.
+
+> Optional: `npm run dev:full` uses the Vercel CLI (`vercel dev`) instead — useful to mirror production routing.
+
+### 5. Production build check
 
 ```bash
 npm run build
@@ -265,7 +259,8 @@ Build output: `dist/`. API routes deploy from `api/`.
 
 | Symptom | What to try |
 | --- | --- |
-| `/api/resolve` → connection refused on Vite `:5173` | Start `npm run dev:full` (API on `:3000`) or only use the `vercel dev` URL |
+| `/api/resolve` empty / JSON parse error | Stop old Vite-only processes, then run `npm run dev` (starts API on `:8787` + UI) |
+| `/api/resolve` → connection refused | Confirm the `api` process is up in the `npm run dev` terminal; default port is `8787` |
 | `WAVEY_TOKEN_SECRET is not configured` | Set the secret in `.env.local` (local) or Vercel env (prod) |
 | YouTube “not playable” / empty formats | Video may be private, age-gated, or region-locked; try `YT_COOKIE` |
 | Instagram reel fails | Confirm the reel is **public**; private / login-walled posts will not resolve |

@@ -4,7 +4,7 @@ import { resolveInstagram } from './_lib/instagram.js'
 import { clientIp, rateLimit } from './_lib/rateLimit.js'
 import { signToken } from './_lib/token.js'
 import { detectPlatform, normalizeUrl } from './_lib/validate.js'
-import { pickYoutubeFormat, resolveYoutube } from './_lib/youtube.js'
+import { resolveYoutube, youtubeOutputHints } from './_lib/youtube.js'
 
 export const config = {
   maxDuration: 60,
@@ -56,15 +56,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (platform === 'youtube') {
       const meta = await resolveYoutube(url.toString())
-      const picked = await pickYoutubeFormat(url.toString(), { kind, quality })
+      const hints = youtubeOutputHints(meta, { kind, quality })
       const token = signToken({
         platform: 'youtube',
         sourceUrl: url.toString(),
         kind,
         quality,
-        mediaUrl: picked.mediaUrl,
-        mimeType: picked.mimeType,
-        filename: picked.filename,
+        mimeType: hints.mimeType,
+        filename: hints.filename,
         title: meta.title,
       })
 
@@ -78,10 +77,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         thumbUrl: meta.thumbUrl,
         thumbHue: meta.thumbHue,
         kindLabel: meta.kindLabel,
-        mimeType: picked.mimeType,
-        filename: picked.filename,
+        mimeType: hints.mimeType,
+        filename: hints.filename,
         token,
-        needsEncode: kind === 'audio' && !/mpeg|mp3/i.test(picked.mimeType),
+        needsEncode: hints.needsEncode,
       })
       return
     }
