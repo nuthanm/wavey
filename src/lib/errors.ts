@@ -38,8 +38,8 @@ export type FriendlyError = {
 const COPY: Record<WaveyErrorCode, Omit<FriendlyError, 'code'>> = {
   api_down: {
     title: 'api ghosted us',
-    message: 'wavey can’t reach the backend rn.',
-    hint: 'run npm run dev (ui + api). then refresh.',
+    message: 'wavey can’t reach the convert backend on port 8787.',
+    hint: 'in the project folder run: npm run dev — wait until you see [wavey-api].',
   },
   api_timeout: {
     title: 'that took forever',
@@ -47,9 +47,9 @@ const COPY: Record<WaveyErrorCode, Omit<FriendlyError, 'code'>> = {
     hint: 'try again — shorter clips / 720p hit different.',
   },
   api_bad_gateway: {
-    title: 'proxy said nope',
-    message: 'ui talked to the api and got a 502 vibes check fail.',
-    hint: 'restart npm run dev. make sure port 8787 isn’t blocked.',
+    title: 'backend hiccup',
+    message: 'the convert api dropped the connection mid-pull.',
+    hint: 'keep npm run dev running (look for [wavey-api] on :8787), then pull again.',
   },
   network: {
     title: 'no signal',

@@ -311,6 +311,13 @@ const server = http.createServer((req, res) => {
   })
 })
 
+// Long YouTube pulls — don't let Node kill idle sockets mid-stream
+server.requestTimeout = 0
+server.headersTimeout = 0
+server.timeout = 0
+server.keepAliveTimeout = 120_000
+
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[wavey-api] http://127.0.0.1:${PORT}`)
+  console.log(`[wavey-api] convert backend ready → http://127.0.0.1:${PORT}`)
+  console.log(`[wavey-api] keep this running while you use the UI on :5173`)
 })

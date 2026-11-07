@@ -1,3 +1,4 @@
+import { apiUrl } from './apiBase'
 import { toWaveyError, WaveyError } from './errors'
 
 export type ResolveResponse = {
@@ -55,7 +56,7 @@ export async function resolveMedia(input: {
 }): Promise<ResolveResponse> {
   let res: Response
   try {
-    res = await fetch('/api/resolve', {
+    res = await fetch(apiUrl('/api/resolve'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
@@ -63,7 +64,7 @@ export async function resolveMedia(input: {
     })
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') throw err
-    throw toWaveyError('Cannot reach /api/resolve', 0)
+    throw toWaveyError('Cannot reach /api/resolve — is the API on :8787 running?', 0)
   }
 
   const data = (await readJsonSafe(res)) as ResolveResponse | ResolveError
@@ -82,7 +83,7 @@ export async function resolveMedia(input: {
 }
 
 export function streamUrl(token: string): string {
-  return `/api/stream?token=${encodeURIComponent(token)}`
+  return apiUrl(`/api/stream?token=${encodeURIComponent(token)}`)
 }
 
 export async function downloadWithProgress(

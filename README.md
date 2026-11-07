@@ -147,10 +147,12 @@ npm run dev
 
 This starts:
 
-- **API** on `http://127.0.0.1:8787` (`scripts/local-api.ts`)
-- **Web UI** on `http://localhost:5173` (Vite proxies `/api` → the local API)
+- **API (convert backend)** on `http://127.0.0.1:8787` (`scripts/local-api.ts`)
+- **Web UI** on `http://localhost:5173`
 
-Open **http://localhost:5173** in your browser.
+In local dev the UI calls the API on **:8787** directly (so long YouTube downloads don’t die in Vite’s proxy).
+
+Open **http://localhost:5173** in your browser. Wait until the terminal shows both `[wavey-api]` and Vite ready before pasting links.
 
 > Optional: `npm run dev:full` uses the Vercel CLI (`vercel dev`) instead — useful to mirror production routing.
 
