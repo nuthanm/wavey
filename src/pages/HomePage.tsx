@@ -153,6 +153,12 @@ export function HomePage() {
   }, [])
 
   useEffect(() => {
+    if (status !== 'ready') return
+    const work = document.querySelector('.rw-work')
+    work?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [status])
+
+  useEffect(() => {
     if (!toast) return
     const ms = toast.kind === 'err' ? 4200 : 2400
     const id = window.setTimeout(() => setToast(null), ms)
@@ -446,7 +452,7 @@ export function HomePage() {
 
   return (
     <>
-      <div className="rw-shell">
+      <div className={`rw-shell${status === 'ready' ? ' is-ready' : ''}`}>
         <section className="rw-brand-panel">
           <div>
             <div className="rw-topbar">
