@@ -3,22 +3,46 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util'
 
 let ffmpegPromise: Promise<FFmpeg> | null = null
 
-async function getFfmpeg(onLog?: (msg: string) => void): Promise<FFmpeg> {
+async function tryLoad(coreURL: string, wasmURL: string): Promise<FFmpeg> {
+  const ffmpeg = new FFmpeg()
+  await ffmpeg.load({
+    coreURL: await toBlobURL(coreURL, 'text/javascript'),
+    wasmURL: await toBlobURL(wasmURL, 'application/wasm'),
+  })
+  return ffmpeg
+}
+
+async function getFfmpeg(): Promise<FFmpeg> {
   if (!ffmpegPromise) {
     ffmpegPromise = (async () => {
-      const ffmpeg = new FFmpeg()
-      if (onLog) {
-        ffmpeg.on('log', ({ message }) => onLog(message))
+      const origin = window.location.origin
+      const sources: Array<[string, string]> = [
+        // Same-origin copy in /public/ffmpeg (see scripts/copy-ffmpeg.mjs)
+        [`${origin}/ffmpeg/ffmpeg-core.js`, `${origin}/ffmpeg/ffmpeg-core.wasm`],
+        [
+          'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js',
+          'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm',
+        ],
+        [
+          'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js',
+          'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm',
+        ],
+      ]
+
+      let lastErr: unknown
+      for (const [js, wasm] of sources) {
+        try {
+          return await tryLoad(js, wasm)
+        } catch (err) {
+          lastErr = err
+        }
       }
-      const base = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm'
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
-      })
-      return ffmpeg
-    })().catch((err) => {
+      throw lastErr instanceof Error ? lastErr : new Error('MP3 encoder failed to load')
+    })()
+
+    // Prevent unhandledrejection if load fails before the UI awaits it
+    ffmpegPromise.catch(() => {
       ffmpegPromise = null
-      throw err
     })
   }
   return ffmpegPromise
@@ -48,7 +72,18 @@ export async function encodeToMp3(
     return input
   }
 
-  const ffmpeg = await getFfmpeg()
+  let ffmpeg: FFmpeg
+  try {
+    ffmpeg = await getFfmpeg()
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    throw new Error(
+      /failed to fetch/i.test(msg)
+        ? 'MP3 encoder could not load — hard refresh and retry'
+        : msg || 'MP3 encoder failed to load',
+    )
+  }
+
   opts.onProgress?.(5)
 
   ffmpeg.on('progress', ({ progress }) => {

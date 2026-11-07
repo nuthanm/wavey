@@ -93,3 +93,23 @@ export function sanitizeFilename(name: string, fallback = 'wavey'): string {
     .slice(0, 80)
   return cleaned || fallback
 }
+
+/** ASCII-only name safe for Node HTTP header values. */
+export function asciiFilename(name: string, fallback = 'wavey.bin'): string {
+  const base = sanitizeFilename(name, fallback)
+  const ascii = base
+    .normalize('NFKD')
+    // eslint-disable-next-line no-control-regex -- header values must be ASCII
+    .replace(/[^\x20-\x7E]/g, '')
+    .replace(/["\\;]/g, '_')
+    .trim()
+  return ascii || fallback
+}
+
+/** RFC 5987 Content-Disposition — avoids "Invalid character in header content". */
+export function contentDispositionAttachment(filename: string): string {
+  const raw = sanitizeFilename(filename, 'wavey.bin')
+  const ascii = asciiFilename(raw)
+  const starred = encodeURIComponent(raw).replace(/['()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${starred}`
+}

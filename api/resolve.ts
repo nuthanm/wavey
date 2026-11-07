@@ -5,7 +5,7 @@ import { resolveInstagram } from './_lib/instagram.js'
 import { clientIp, rateLimit } from './_lib/rateLimit.js'
 import { signToken } from './_lib/token.js'
 import { detectPlatform, normalizeUrl } from './_lib/validate.js'
-import { resolveYoutube, youtubeOutputHints } from './_lib/youtube.js'
+import { pickYoutubeFormat, resolveYoutube, youtubeOutputHints } from './_lib/youtube.js'
 
 export const config = {
   maxDuration: 60,
@@ -58,13 +58,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (platform === 'youtube') {
       const meta = await resolveYoutube(url.toString())
       const hints = youtubeOutputHints(meta, { kind, quality })
+      let mediaUrl: string | undefined
+      let mimeType = hints.mimeType
+      let filename = hints.filename
+      try {
+        const picked = await pickYoutubeFormat(url.toString(), { kind, quality })
+        mediaUrl = picked.mediaUrl
+        mimeType = picked.mimeType
+        filename = picked.filename
+      } catch {
+        // stream falls back to Innertube download
+      }
       const token = signToken({
         platform: 'youtube',
         sourceUrl: url.toString(),
         kind,
         quality,
-        mimeType: hints.mimeType,
-        filename: hints.filename,
+        mediaUrl,
+        mimeType,
+        filename,
         title: meta.title,
       })
 
@@ -78,8 +90,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         thumbUrl: meta.thumbUrl,
         thumbHue: meta.thumbHue,
         kindLabel: meta.kindLabel,
-        mimeType: hints.mimeType,
-        filename: hints.filename,
+        mimeType,
+        filename,
         token,
         needsEncode: hints.needsEncode,
       })

@@ -48,36 +48,148 @@ async function readJsonSafe(res: Response): Promise<unknown> {
   }
 }
 
+function isAbort(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true
+  if (err instanceof DOMException && err.name === 'AbortError') return true
+  const msg = err instanceof Error ? err.message : String(err || '')
+  return /aborted|aborterror/i.test(msg)
+}
+
+/** XHR — more reliable than fetch for large binary + progress (extensions/HMR-safe). */
+function xhrRequest(
+  url: string,
+  opts: {
+    method?: string
+    body?: string
+    headers?: Record<string, string>
+    signal?: AbortSignal
+    onProgress?: (pct: number) => void
+  } = {},
+): Promise<{ status: number; body: ArrayBuffer; contentType: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open(opts.method || 'GET', url, true)
+    xhr.responseType = 'arraybuffer'
+    xhr.timeout = 0
+    for (const [k, v] of Object.entries(opts.headers || {})) {
+      xhr.setRequestHeader(k, v)
+    }
+
+    const onAbort = () => {
+      xhr.abort()
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    if (opts.signal?.aborted) {
+      onAbort()
+      return
+    }
+    opts.signal?.addEventListener('abort', onAbort)
+
+    xhr.onprogress = (e) => {
+      if (!opts.onProgress) return
+      if (e.lengthComputable && e.total > 0) {
+        opts.onProgress(Math.min(95, Math.round((e.loaded / e.total) * 95)))
+      } else if (e.loaded > 0) {
+        opts.onProgress(Math.min(90, 10 + Math.round(Math.log10(e.loaded + 10) * 12)))
+      }
+    }
+
+    xhr.onload = () => {
+      opts.signal?.removeEventListener('abort', onAbort)
+      resolve({
+        status: xhr.status,
+        body: xhr.response as ArrayBuffer,
+        contentType: xhr.getResponseHeader('content-type') || 'application/octet-stream',
+      })
+    }
+    xhr.onerror = () => {
+      opts.signal?.removeEventListener('abort', onAbort)
+      reject(new TypeError('Failed to fetch'))
+    }
+    xhr.ontimeout = () => {
+      opts.signal?.removeEventListener('abort', onAbort)
+      reject(new TypeError('Failed to fetch'))
+    }
+    xhr.onabort = () => {
+      opts.signal?.removeEventListener('abort', onAbort)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    xhr.send(opts.body ?? null)
+  })
+}
+
+export async function checkApiHealth(): Promise<boolean> {
+  try {
+    const res = await fetch(apiUrl('/api/health'), { cache: 'no-store' })
+    if (!res.ok) return false
+    const data = (await res.json()) as { ok?: boolean }
+    return Boolean(data.ok)
+  } catch {
+    try {
+      const xhr = await xhrRequest(apiUrl('/api/health'), { method: 'GET' })
+      if (xhr.status < 200 || xhr.status >= 300) return false
+      const text = new TextDecoder().decode(xhr.body)
+      return text.includes('"ok":true')
+    } catch {
+      return false
+    }
+  }
+}
+
 export async function resolveMedia(input: {
   url: string
   output: 'mp3' | 'mp4'
   quality: number
   signal?: AbortSignal
 }): Promise<ResolveResponse> {
-  let res: Response
+  const url = apiUrl('/api/resolve')
+  const body = JSON.stringify({
+    url: input.url,
+    output: input.output,
+    quality: input.quality,
+  })
+
+  let data: ResolveResponse | ResolveError
+  let status: number
+
   try {
-    res = await fetch(apiUrl('/api/resolve'), {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
+      body,
       signal: input.signal,
+      cache: 'no-store',
     })
+    status = res.status
+    data = (await readJsonSafe(res)) as ResolveResponse | ResolveError
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err
-    throw toWaveyError('Cannot reach /api/resolve — is the API on :8787 running?', 0)
+    if (isAbort(err, input.signal)) throw new DOMException('Aborted', 'AbortError')
+    try {
+      const xhr = await xhrRequest(url, {
+        method: 'POST',
+        body,
+        headers: { 'Content-Type': 'application/json' },
+        signal: input.signal,
+      })
+      status = xhr.status
+      const text = new TextDecoder().decode(xhr.body)
+      data = JSON.parse(text) as ResolveResponse | ResolveError
+    } catch (xhrErr) {
+      if (isAbort(xhrErr, input.signal)) throw new DOMException('Aborted', 'AbortError')
+      throw toWaveyError('Cannot reach /api/resolve', 0)
+    }
   }
 
-  const data = (await readJsonSafe(res)) as ResolveResponse | ResolveError
-  if (!res.ok || !data || typeof data !== 'object' || !('ok' in data) || !data.ok) {
+  if (!status || status >= 400 || !data || typeof data !== 'object' || !('ok' in data) || !data.ok) {
     const serverMsg =
       data && typeof data === 'object' && 'error' in data && typeof data.error === 'string'
         ? data.error
-        : `Resolve failed (${res.status})`
-    const err = toWaveyError(serverMsg, res.status)
+        : `Resolve failed (${status})`
+    const mapped = toWaveyError(serverMsg, status)
     if (data && typeof data === 'object' && 'hint' in data && typeof data.hint === 'string') {
-      err.hint = data.hint
+      mapped.hint = data.hint
     }
-    throw err
+    throw mapped
   }
   return data
 }
@@ -91,58 +203,64 @@ export async function downloadWithProgress(
   onProgress: (pct: number) => void,
   signal?: AbortSignal,
 ): Promise<{ blob: Blob; contentType: string }> {
-  let res: Response
-  try {
-    res = await fetch(streamUrl(token), { signal })
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err
-    throw toWaveyError('Cannot reach /api/stream', 0)
-  }
+  const url = streamUrl(token)
+  onProgress(5)
 
-  if (!res.ok) {
-    let message = `Download failed (${res.status})`
+  // XHR first — survives Vite HMR noise better than fetch+arrayBuffer for big bodies
+  try {
+    const xhr = await xhrRequest(url, { method: 'GET', signal, onProgress })
+    if (xhr.status < 200 || xhr.status >= 300) {
+      const text = new TextDecoder().decode(xhr.body)
+      let message = `Download failed (${xhr.status})`
+      try {
+        const parsed = JSON.parse(text) as { error?: string }
+        if (parsed.error) message = parsed.error
+      } catch {
+        // ignore
+      }
+      throw toWaveyError(message, xhr.status)
+    }
+    if (!xhr.body || xhr.body.byteLength === 0) {
+      throw toWaveyError('download stream interrupted / blocked by browser', 0)
+    }
+    onProgress(96)
+    return {
+      blob: new Blob([xhr.body], { type: xhr.contentType }),
+      contentType: xhr.contentType,
+    }
+  } catch (err) {
+    if (isAbort(err, signal)) throw new DOMException('Aborted', 'AbortError')
+    if (err instanceof WaveyError) throw err
+
+    // Fallback fetch
     try {
-      const err = (await readJsonSafe(res)) as { error?: string }
-      if (err && typeof err === 'object' && 'error' in err && err.error) {
-        message = String(err.error)
-      }
-    } catch (e) {
-      if (e instanceof WaveyError) throw e
-    }
-    throw toWaveyError(message, res.status)
-  }
-
-  const contentType = res.headers.get('content-type') || 'application/octet-stream'
-  const total = Number(res.headers.get('content-length') || 0)
-  const reader = res.body?.getReader()
-  if (!reader) {
-    const blob = await res.blob()
-    onProgress(100)
-    return { blob, contentType }
-  }
-
-  const chunks: Uint8Array[] = []
-  let received = 0
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (value) {
-        chunks.push(value)
-        received += value.byteLength
-        if (total > 0) {
-          onProgress(Math.min(95, Math.round((received / total) * 95)))
-        } else {
-          onProgress(Math.min(90, 10 + Math.round(Math.log10(received + 10) * 12)))
+      const res = await fetch(url, { signal, cache: 'no-store' })
+      if (!res.ok) {
+        let message = `Download failed (${res.status})`
+        try {
+          const body = (await readJsonSafe(res)) as { error?: string }
+          if (body?.error) message = String(body.error)
+        } catch (e) {
+          if (e instanceof WaveyError) throw e
         }
+        throw toWaveyError(message, res.status)
       }
+      onProgress(40)
+      const buf = await res.arrayBuffer()
+      if (!buf.byteLength) {
+        throw toWaveyError('download stream interrupted / blocked by browser', 0)
+      }
+      onProgress(96)
+      return {
+        blob: new Blob([buf], {
+          type: res.headers.get('content-type') || 'application/octet-stream',
+        }),
+        contentType: res.headers.get('content-type') || 'application/octet-stream',
+      }
+    } catch (fetchErr) {
+      if (isAbort(fetchErr, signal)) throw new DOMException('Aborted', 'AbortError')
+      if (fetchErr instanceof WaveyError) throw fetchErr
+      throw toWaveyError('download stream interrupted / blocked by browser', 0)
     }
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err
-    throw toWaveyError('download stream interrupted', res.status)
   }
-
-  const blob = new Blob(chunks as BlobPart[], { type: contentType })
-  onProgress(96)
-  return { blob, contentType }
 }

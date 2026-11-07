@@ -15,15 +15,20 @@
   "homepage": "https://github.com/nuthanm/wavey#readme",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -n api,web -c lime,cyan \"npm run dev:api\" \"npm run dev:web\"",
+    "predev": "node scripts/copy-ffmpeg.mjs",
+    "prebuild": "node scripts/copy-ffmpeg.mjs",
+    "dev": "vite",
     "dev:api": "tsx scripts/local-api.ts",
     "dev:web": "vite",
+    "dev:split": "concurrently -k -n api,web -c lime,cyan \"npm run dev:api\" \"vite --port 5173\"",
     "dev:full": "vercel dev",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "copy:ffmpeg": "node scripts/copy-ffmpeg.mjs"
   },
   "dependencies": {
+    "@ffmpeg/core": "^0.12.6",
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
     "framer-motion": "^14.10.1",

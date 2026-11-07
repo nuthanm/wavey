@@ -13,6 +13,7 @@ dist-ssr
 *.local
 tmp-body.json
 tmp-*.json
+public/ffmpeg/
 
 # Editor directories and files
 .vscode/*

@@ -1,20 +1,15 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { Readable } from 'node:stream'
-import { pipeline } from 'node:stream/promises'
+import { fetchToBuffer, streamToBuffer } from './_lib/buffer.js'
 import { friendlyApiError } from './_lib/friendly.js'
 import { handleOptions, sendError, setCors } from './_lib/http.js'
 import { igFetchHeaders } from './_lib/instagram.js'
 import { clientIp, rateLimit } from './_lib/rateLimit.js'
 import { verifyToken } from './_lib/token.js'
-import { assertAllowedMediaUrl } from './_lib/validate.js'
+import { assertAllowedMediaUrl, contentDispositionAttachment } from './_lib/validate.js'
 import { downloadYoutubeStream } from './_lib/youtube.js'
 
 export const config = {
   maxDuration: 300,
-}
-
-function nodeStreamFromWeb(body: ReadableStream<Uint8Array>): Readable {
-  return Readable.fromWeb(body as import('node:stream/web').ReadableStream)
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -40,58 +35,49 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const payload = verifyToken(tokenParam)
     setCors(res)
-    res.setHeader('Content-Disposition', `attachment; filename="${payload.filename.replace(/"/g, '')}"`)
-    res.setHeader('Cache-Control', 'no-store')
 
-    if (payload.platform === 'youtube') {
-      // Prefer Innertube download stream (handles cipher / segments)
+    const ytHeaders = {
+      'User-Agent':
+        'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
+      Accept: '*/*',
+    }
+
+    let buffer: Buffer | undefined
+    let contentType = payload.mimeType || 'application/octet-stream'
+    let filename = payload.filename
+    let mediaErr: unknown
+
+    if (payload.mediaUrl) {
       try {
-        const dl = await downloadYoutubeStream(payload.sourceUrl, {
-          kind: payload.kind,
-          quality: payload.quality,
-        })
-        res.setHeader('Content-Type', dl.mimeType)
-        res.setHeader(
-          'Content-Disposition',
-          `attachment; filename="${dl.filename.replace(/"/g, '')}"`,
-        )
-        await pipeline(nodeStreamFromWeb(dl.stream), res)
-        return
-      } catch {
-        // fall through to direct mediaUrl proxy
+        const mediaUrl = assertAllowedMediaUrl(payload.mediaUrl)
+        const headers = payload.platform === 'instagram' ? igFetchHeaders() : ytHeaders
+        const fetched = await fetchToBuffer(mediaUrl.toString(), headers)
+        buffer = fetched.buffer
+        contentType = payload.mimeType || fetched.contentType
+      } catch (err) {
+        mediaErr = err
+        if (payload.platform !== 'youtube') throw err
       }
     }
 
-    if (!payload.mediaUrl) {
-      sendError(res, 400, 'No media URL in token — resolve again')
-      return
+    if (!buffer && payload.platform === 'youtube') {
+      const dl = await downloadYoutubeStream(payload.sourceUrl, {
+        kind: payload.kind,
+        quality: payload.quality,
+      })
+      buffer = await streamToBuffer(dl.stream)
+      contentType = dl.mimeType
+      filename = dl.filename
+    }
+    if (!buffer) {
+      throw mediaErr || new Error('No media URL in token — resolve again')
     }
 
-    const mediaUrl = assertAllowedMediaUrl(payload.mediaUrl)
-    const headers: Record<string, string> =
-      payload.platform === 'instagram'
-        ? igFetchHeaders()
-        : {
-            'User-Agent':
-              'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
-            Accept: '*/*',
-          }
-
-    const upstream = await fetch(mediaUrl.toString(), { headers })
-    if (!upstream.ok || !upstream.body) {
-      sendError(res, 502, `Upstream fetch failed (${upstream.status})`)
-      return
-    }
-
-    const contentType =
-      payload.mimeType ||
-      upstream.headers.get('content-type') ||
-      'application/octet-stream'
     res.setHeader('Content-Type', contentType)
-    const len = upstream.headers.get('content-length')
-    if (len) res.setHeader('Content-Length', len)
-
-    await pipeline(nodeStreamFromWeb(upstream.body), res)
+    res.setHeader('Content-Length', String(buffer.byteLength))
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('Content-Disposition', contentDispositionAttachment(filename))
+    res.status(200).end(buffer)
   } catch (err) {
     const friendly = friendlyApiError(err)
     if (!res.headersSent) {

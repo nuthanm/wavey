@@ -38,6 +38,7 @@ import {
   assertAllowedMediaUrl,
   detectPlatform,
   normalizeUrl,
+  contentDispositionAttachment,
 } from '../api/_lib/validate.ts'
 import {
   downloadYoutubeStream,
@@ -47,13 +48,21 @@ import {
 
 const PORT = Number(process.env.WAVEY_API_PORT || 8787)
 
+function corsHeaders(): Record<string, string> {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    // Chrome private-network / localhost quirks
+    'Access-Control-Allow-Private-Network': 'true',
+  }
+}
+
 function sendJson(res: http.ServerResponse, status: number, body: unknown) {
   const payload = JSON.stringify(body)
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    ...corsHeaders(),
   })
   res.end(payload)
 }
@@ -201,12 +210,9 @@ async function handleStream(req: http.IncomingMessage, res: http.ServerResponse)
     }
 
     const payload = verifyToken(tokenParam)
-    res.setHeader('Access-Control-Allow-Origin', '*')
+    for (const [k, v] of Object.entries(corsHeaders())) res.setHeader(k, v)
     res.setHeader('Cache-Control', 'no-store')
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="${payload.filename.replace(/"/g, '')}"`,
-    )
+    res.setHeader('Content-Disposition', contentDispositionAttachment(payload.filename))
 
     if (payload.platform === 'youtube') {
       try {
@@ -216,8 +222,8 @@ async function handleStream(req: http.IncomingMessage, res: http.ServerResponse)
         })
         res.writeHead(200, {
           'Content-Type': dl.mimeType,
-          'Content-Disposition': `attachment; filename="${dl.filename.replace(/"/g, '')}"`,
-          'Access-Control-Allow-Origin': '*',
+          'Content-Disposition': contentDispositionAttachment(dl.filename),
+          ...corsHeaders(),
           'Cache-Control': 'no-store',
         })
         await pipeline(nodeStreamFromWeb(dl.stream), res)
@@ -254,9 +260,9 @@ async function handleStream(req: http.IncomingMessage, res: http.ServerResponse)
       'application/octet-stream'
     const head: Record<string, string> = {
       'Content-Type': contentType,
-      'Access-Control-Allow-Origin': '*',
+      ...corsHeaders(),
       'Cache-Control': 'no-store',
-      'Content-Disposition': `attachment; filename="${payload.filename.replace(/"/g, '')}"`,
+      'Content-Disposition': contentDispositionAttachment(payload.filename),
     }
     const len = upstream.headers.get('content-length')
     if (len) head['Content-Length'] = len
@@ -270,19 +276,22 @@ async function handleStream(req: http.IncomingMessage, res: http.ServerResponse)
 
 const server = http.createServer((req, res) => {
   void (async () => {
-    const path = (req.url || '/').split('?')[0]
+    const method = (req.method || 'GET').toUpperCase()
+    const path = ((req.url || '/').split('?')[0] || '/').replace(/\/+$/, '') || '/'
 
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      })
+    console.log(`[wavey-api] ${method} ${path}`)
+
+    if (method === 'OPTIONS') {
+      res.writeHead(204, corsHeaders())
       res.end()
       return
     }
 
-    if (path === '/api/health' && req.method === 'GET') {
+    if (path === '/api/health') {
+      if (method !== 'GET') {
+        sendError(res, 405, 'health is GET only', { code: 'bad_method' })
+        return
+      }
       sendJson(res, 200, {
         ok: true,
         service: 'wavey-local',
@@ -293,20 +302,34 @@ const server = http.createServer((req, res) => {
       return
     }
 
-    if (path === '/api/resolve' && req.method === 'POST') {
+    if (path === '/api/resolve') {
+      if (method !== 'POST') {
+        sendError(res, 405, 'resolve needs POST from the Wavey app — don’t open this URL in the browser', {
+          code: 'bad_method',
+          hint: 'use http://localhost:5173 and paste a link there',
+        })
+        return
+      }
       await handleResolve(req, res)
       return
     }
 
-    if (path === '/api/stream' && req.method === 'GET') {
+    if (path === '/api/stream') {
+      if (method !== 'GET') {
+        sendError(res, 405, 'stream is GET only', { code: 'bad_method' })
+        return
+      }
       await handleStream(req, res)
       return
     }
 
-    sendError(res, 404, 'Not found')
+    sendError(res, 404, `no route for ${method} ${path}`, {
+      code: 'not_found',
+      hint: 'open the app at http://localhost:5173 — not the :8787 API port',
+    })
   })().catch((err) => {
     if (!res.headersSent) {
-      sendError(res, 500, err instanceof Error ? err.message : 'Internal error')
+      sendFriendly(res, 500, err)
     }
   })
 })
@@ -317,7 +340,8 @@ server.headersTimeout = 0
 server.timeout = 0
 server.keepAliveTimeout = 120_000
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[wavey-api] convert backend ready → http://127.0.0.1:${PORT}`)
+// Bind all local interfaces so both localhost and 127.0.0.1 work (Windows IPv6 quirk).
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[wavey-api] convert backend ready → http://localhost:${PORT}`)
   console.log(`[wavey-api] keep this running while you use the UI on :5173`)
 })

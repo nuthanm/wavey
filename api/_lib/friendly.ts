@@ -88,7 +88,18 @@ export function friendlyApiError(raw: unknown): { error: string; code: string; h
       hint: 'confirm it’s public and not deleted.',
     }
   }
-  if (/not playable|no streams|youtube/.test(lower)) {
+  if (
+    /non 2xx|fetch_failed|no matching formats|not playable|no streams|upstream fetch failed/.test(
+      lower,
+    )
+  ) {
+    return {
+      code: 'yt_unavailable',
+      error: 'youtube ghosted the stream.',
+      hint: 'retry once — or try 720p / a shorter public clip.',
+    }
+  }
+  if (/youtube/.test(lower)) {
     return {
       code: 'yt_unavailable',
       error: 'youtube said no to that video.',

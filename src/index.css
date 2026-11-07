@@ -961,6 +961,17 @@ img {
   animation: pulseDot 1.6s ease-in-out infinite;
 }
 
+.rw-pill.is-down {
+  color: #ffb4a2;
+  border-color: rgba(255, 140, 110, 0.35);
+}
+
+.rw-pill.is-down::before {
+  background: #ff6b4a;
+  box-shadow: 0 0 10px #ff6b4a;
+  animation: none;
+}
+
 @keyframes pulseDot {
   0%,
   100% {
@@ -1098,6 +1109,7 @@ img {
 }
 
 .rw-mode {
+  position: relative;
   border-radius: 999px;
   padding: 12px 10px;
   font-weight: 600;
@@ -1112,8 +1124,41 @@ img {
   transform: translateY(-1px);
 }
 
-.rw-mode:active {
+.rw-mode:active:not(:disabled) {
   transform: scale(0.98);
+}
+
+.rw-mode.is-soon,
+.rw-mode:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  color: var(--muted);
+  background: transparent;
+  transform: none;
+}
+
+.rw-mode.is-soon span:first-child {
+  filter: grayscale(0.3);
+}
+
+.rw-soon-tag {
+  position: absolute;
+  top: -7px;
+  right: 8px;
+  z-index: 1;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  line-height: 1.2;
+  color: #081000;
+  background: var(--lime);
+  border: 1px solid color-mix(in srgb, var(--lime) 70%, #fff);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  white-space: nowrap;
 }
 
 .rw-label {

@@ -145,16 +145,13 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 npm run dev
 ```
 
-This starts:
+This starts **one** Vite server on **http://localhost:5173** with the convert API built in (`/api/resolve`, `/api/stream`).
 
-- **API (convert backend)** on `http://127.0.0.1:8787` (`scripts/local-api.ts`)
-- **Web UI** on `http://localhost:5173`
+Open **http://localhost:5173** (exactly that port). Wait until Vite prints `Local: http://localhost:5173/`.
 
-In local dev the UI calls the API on **:8787** directly (so long YouTube downloads don’t die in Vite’s proxy).
+If pulls fail in a normal Chrome window, try **Incognito** (some extensions block `fetch`).
 
-Open **http://localhost:5173** in your browser. Wait until the terminal shows both `[wavey-api]` and Vite ready before pasting links.
-
-> Optional: `npm run dev:full` uses the Vercel CLI (`vercel dev`) instead — useful to mirror production routing.
+> Optional: `npm run dev:split` runs API on `:8787` + UI separately. `npm run dev:full` uses Vercel CLI.
 
 ### 5. Production build check
 
@@ -261,8 +258,8 @@ Build output: `dist/`. API routes deploy from `api/`.
 
 | Symptom | What to try |
 | --- | --- |
-| `/api/resolve` empty / JSON parse error | Stop old Vite-only processes, then run `npm run dev` (starts API on `:8787` + UI) |
-| `/api/resolve` → connection refused | Confirm the `api` process is up in the `npm run dev` terminal; default port is `8787` |
+| `/api/resolve` empty / JSON parse / “api ghosted us” | Stop all old Node/Vite terminals, run `npm run dev`, open **only** http://localhost:5173 — try Incognito if a Chrome extension blocks fetch |
+| Port 5173 already in use | Kill the old Vite process; Wavey needs **5173** (`strictPort`) |
 | `WAVEY_TOKEN_SECRET is not configured` | Set the secret in `.env.local` (local) or Vercel env (prod) |
 | YouTube “not playable” / empty formats | Video may be private, age-gated, or region-locked; try `YT_COOKIE` |
 | Instagram reel fails | Confirm the reel is **public**; private / login-walled posts will not resolve |

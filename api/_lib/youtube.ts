@@ -25,6 +25,10 @@ export type PickedFormat = {
 
 let innertubePromise: Promise<Innertube> | null = null
 
+function resetTube() {
+  innertubePromise = null
+}
+
 async function getTube(): Promise<Innertube> {
   if (!innertubePromise) {
     innertubePromise = Innertube.create({
@@ -54,14 +58,19 @@ function pickThumb(info: {
 const CLIENTS = ['ANDROID', 'IOS', 'TV', 'WEB'] as const
 
 async function getInfo(videoId: string) {
-  const tube = await getTube()
   let lastErr: unknown
-  for (const client of CLIENTS) {
-    try {
-      return await tube.getBasicInfo(videoId, { client })
-    } catch (err) {
-      lastErr = err
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const tube = await getTube()
+    for (const client of CLIENTS) {
+      try {
+        return await tube.getBasicInfo(videoId, { client })
+      } catch (err) {
+        lastErr = err
+        const msg = err instanceof Error ? err.message : String(err)
+        if (/non 2xx|fetch_failed/i.test(msg)) resetTube()
+      }
     }
+    resetTube()
   }
   throw lastErr instanceof Error ? lastErr : new Error('Failed to load YouTube info')
 }
@@ -123,18 +132,64 @@ export function youtubeOutputHints(
   }
 }
 
+function videoQualityFallbacks(height: number): Array<string | number> {
+  const label = videoQualityLabel(height)
+  const ladder = ['2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p']
+  const idx = ladder.indexOf(label)
+  const fromRequested = idx >= 0 ? ladder.slice(idx) : ladder.slice(2)
+  return [...fromRequested, 'best', 'bestefficiency']
+}
+
+function chooseBestFormat(
+  info: Awaited<ReturnType<typeof getInfo>>,
+  opts: { kind: 'audio' | 'video'; quality: number },
+) {
+  if (opts.kind === 'audio') {
+    return info.chooseFormat({ type: 'audio', quality: 'best', format: 'any' })
+  }
+
+  let lastErr: unknown
+  for (const quality of videoQualityFallbacks(opts.quality)) {
+    try {
+      const format = info.chooseFormat({
+        type: 'video+audio',
+        quality,
+        format: 'any',
+      })
+      const mime = (format.mime_type || '').toLowerCase()
+      if (mime.startsWith('audio/')) {
+        lastErr = new Error('audio-only format')
+        continue
+      }
+      return format
+    } catch (err) {
+      lastErr = err
+    }
+  }
+
+  // Last ditch: any video (may be video-only)
+  try {
+    return info.chooseFormat({ type: 'video', quality: 'best', format: 'any' })
+  } catch (err) {
+    throw lastErr instanceof Error ? lastErr : err
+  }
+}
+
 export async function pickYoutubeFormat(
   sourceUrl: string,
   opts: { kind: 'audio' | 'video'; quality: number },
 ): Promise<PickedFormat & { title: string }> {
   const meta = await resolveYoutube(sourceUrl)
   const info = await getInfo(meta.videoId)
+  const format = chooseBestFormat(info, opts)
 
-  const format = info.chooseFormat({
-    type: opts.kind === 'audio' ? 'audio' : 'video+audio',
-    quality: opts.kind === 'audio' ? 'best' : videoQualityLabel(opts.quality),
-    format: 'any',
-  })
+  const mime = (format.mime_type || '').split(';')[0]!.trim().toLowerCase()
+  if (opts.kind === 'video' && mime.startsWith('audio/')) {
+    throw new Error('No progressive video URL — use Innertube download')
+  }
+  if (opts.kind === 'audio' && mime.startsWith('video/')) {
+    throw new Error('Got video container for audio request')
+  }
 
   let mediaUrl = format.url || ''
   if (!mediaUrl) {
@@ -145,23 +200,12 @@ export async function pickYoutubeFormat(
     }
   }
   if (!mediaUrl) {
-    // Last resort: streaming data helper
-    try {
-      const data = await info.getStreamingInfo()
-      const list =
-        opts.kind === 'audio'
-          ? data.audio_sets?.flatMap((s) => s.representationss || []) || []
-          : []
-      void list
-    } catch {
-      // ignore
-    }
     throw new Error('No valid URL to decipher — try again or set YT_COOKIE')
   }
 
   const ext =
     opts.kind === 'audio'
-      ? /webm|opus/i.test(format.mime_type)
+      ? /webm|opus/i.test(mime)
         ? 'webm'
         : 'm4a'
       : 'mp4'
@@ -169,7 +213,7 @@ export async function pickYoutubeFormat(
 
   return {
     mediaUrl,
-    mimeType: format.mime_type.split(';')[0]!.trim(),
+    mimeType: mime || (opts.kind === 'audio' ? 'audio/mp4' : 'video/mp4'),
     kind: opts.kind,
     quality: opts.kind === 'audio' ? opts.quality : format.height || opts.quality,
     filename: `${base}.${ext}`,
@@ -185,53 +229,56 @@ export async function downloadYoutubeStream(
   const meta = await resolveYoutube(sourceUrl)
   const tube = await getTube()
   const hints = youtubeOutputHints(meta, opts)
+  const ytHeaders = {
+    'User-Agent':
+      'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
+    Accept: '*/*',
+  }
+
+  // Prefer direct CDN URL first — more stable through Vite middleware than tube.download()
+  try {
+    const picked = await pickYoutubeFormat(sourceUrl, opts)
+    const res = await fetch(picked.mediaUrl, { headers: ytHeaders })
+    if (res.ok && res.body) {
+      return {
+        stream: res.body,
+        mimeType: picked.mimeType,
+        filename: picked.filename,
+        title: picked.title,
+      }
+    }
+  } catch {
+    // fall through to Innertube download
+  }
+
+  const qualities =
+    opts.kind === 'audio'
+      ? (['best'] as Array<string | number>)
+      : videoQualityFallbacks(opts.quality)
 
   let lastErr: unknown
   for (const client of CLIENTS) {
-    try {
-      const stream = await tube.download(meta.videoId, {
-        type: opts.kind === 'audio' ? 'audio' : 'video+audio',
-        quality: opts.kind === 'audio' ? 'best' : videoQualityLabel(opts.quality),
-        format: 'any',
-        client,
-      })
-      return {
-        stream,
-        mimeType: hints.mimeType,
-        filename: hints.filename,
-        title: meta.title,
+    for (const quality of qualities) {
+      try {
+        const stream = await tube.download(meta.videoId, {
+          type: opts.kind === 'audio' ? 'audio' : 'video+audio',
+          quality,
+          format: 'any',
+          client,
+        })
+        return {
+          stream,
+          mimeType: hints.mimeType,
+          filename: hints.filename,
+          title: meta.title,
+        }
+      } catch (err) {
+        lastErr = err
       }
-    } catch (err) {
-      lastErr = err
     }
   }
 
-  // Fallback: direct CDN URL when download() fails
-  try {
-    const picked = await pickYoutubeFormat(sourceUrl, opts)
-    const res = await fetch(picked.mediaUrl, {
-      headers: {
-        'User-Agent':
-          'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
-        Accept: '*/*',
-      },
-    })
-    if (!res.ok || !res.body) {
-      throw new Error(`Upstream media fetch failed (${res.status})`)
-    }
-    return {
-      stream: res.body,
-      mimeType: picked.mimeType,
-      filename: picked.filename,
-      title: picked.title,
-    }
-  } catch (err) {
-    const msg =
-      err instanceof Error
-        ? err.message
-        : lastErr instanceof Error
-          ? lastErr.message
-          : 'YouTube download failed'
-    throw new Error(msg)
-  }
+  throw new Error(
+    lastErr instanceof Error ? lastErr.message : 'YouTube download failed',
+  )
 }

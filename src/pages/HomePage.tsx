@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Link } from 'react-router-dom'
-import { downloadWithProgress, resolveMedia, type ResolveResponse } from '../lib/api'
+import {
+  checkApiHealth,
+  downloadWithProgress,
+  resolveMedia,
+  type ResolveResponse,
+} from '../lib/api'
 import { encodeToMp3 } from '../lib/encodeMp3'
 import {
   friendlyFromUnknown,
@@ -17,6 +22,8 @@ import { RealisticWave } from '../components/RealisticWave'
 type Mode = 'youtube' | 'instagram'
 type OutputFormat = 'mp3' | 'mp4'
 type IgKind = 'reel' | 'story'
+
+const INSTAGRAM_ENABLED = false
 type QualityId = 'chill' | 'clean' | 'cranked' | 'studio'
 type VideoQualityId = 'hd' | 'fhd' | 'qhd' | 'uhd'
 
@@ -75,6 +82,7 @@ export function HomePage() {
   const [progressLabel, setProgressLabel] = useState('warming up…')
   const [mediaUrl, setMediaUrl] = useState<string | null>(null)
   const [mediaKind, setMediaKind] = useState<'audio' | 'video'>('audio')
+  const [readyBlob, setReadyBlob] = useState<Blob | null>(null)
   const [resolved, setResolved] = useState<ResolveResponse | null>(null)
   const [friendlyError, setFriendlyError] = useState<FriendlyError | null>(null)
   const [resolving, setResolving] = useState(false)
@@ -82,6 +90,7 @@ export function HomePage() {
   const [current, setCurrent] = useState(0)
   const [duration, setDuration] = useState(0)
   const [toast, setToast] = useState<{ text: string; kind: 'ok' | 'err' } | null>(null)
+  const [apiOnline, setApiOnline] = useState<boolean | null>(null)
 
   const showOk = (text: string) => setToast({ text, kind: 'ok' })
   const showErr = (err: unknown) => {
@@ -89,6 +98,20 @@ export function HomePage() {
     setFriendlyError(friendly)
     setToast({ text: `${friendly.title} — ${friendly.message}`, kind: 'err' })
   }
+
+  useEffect(() => {
+    let cancelled = false
+    const ping = async () => {
+      const ok = await checkApiHealth()
+      if (!cancelled) setApiOnline(ok)
+    }
+    void ping()
+    const id = window.setInterval(() => void ping(), 8000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [])
 
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -116,13 +139,18 @@ export function HomePage() {
     !resolving &&
     (detected === mode || detected === 'unknown')
 
+  // Only revoke blob URLs — never abort the active pull when mediaUrl changes
   useEffect(() => {
-    const abort = abortRef.current
     return () => {
-      abort?.abort()
       if (mediaUrl) URL.revokeObjectURL(mediaUrl)
     }
   }, [mediaUrl])
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort()
+    }
+  }, [])
 
   useEffect(() => {
     if (!toast) return
@@ -131,10 +159,14 @@ export function HomePage() {
     return () => window.clearTimeout(id)
   }, [toast])
 
-  // Debounced resolve for live preview
+  // Debounced resolve for live preview (paused while a pull is in flight)
   useEffect(() => {
     const trimmed = url.trim()
-    if (trimmed.length < 12 || (detected && detected !== 'unknown' && detected !== mode)) {
+    if (
+      status === 'ripping' ||
+      trimmed.length < 12 ||
+      (detected && detected !== 'unknown' && detected !== mode)
+    ) {
       return
     }
 
@@ -144,11 +176,12 @@ export function HomePage() {
         setResolving(true)
         setFriendlyError(null)
         try {
+          // Preview/resolve as video — MP3 is extracted client-side from that file
           const qualityValue =
-            outputFormat === 'mp4' ? selectedVideo.height : selectedAudio.kbps
+            outputFormat === 'mp3' ? 720 : selectedVideo.height
           const data = await resolveMedia({
             url: trimmed,
-            output: outputFormat,
+            output: 'mp4',
             quality: qualityValue,
             signal: controller.signal,
           })
@@ -159,8 +192,11 @@ export function HomePage() {
             setIgKind(data.isStory || /story/i.test(data.kindLabel) ? 'story' : 'reel')
           }
         } catch (err) {
+          // Chrome often reports aborted fetch as TypeError: Failed to fetch
           if (controller.signal.aborted) return
           if (err instanceof DOMException && err.name === 'AbortError') return
+          const msg = err instanceof Error ? err.message : String(err)
+          if (/failed to fetch|networkerror|aborted/i.test(msg)) return
           setResolved(null)
           setFriendlyError(friendlyFromUnknown(err))
         } finally {
@@ -173,9 +209,10 @@ export function HomePage() {
       controller.abort()
       window.clearTimeout(timer)
     }
-  }, [url, mode, outputFormat, selectedAudio.kbps, selectedVideo.height, detected])
+  }, [url, mode, outputFormat, selectedAudio.kbps, selectedVideo.height, detected, status])
 
   const switchMode = (next: Mode) => {
+    if (next === 'instagram' && !INSTAGRAM_ENABLED) return
     setMode(next)
     setStatus('idle')
     setProgress(0)
@@ -193,8 +230,9 @@ export function HomePage() {
       if (text) {
         setUrl(text.trim())
         const source = detectSource(text.trim())
-        if (source === 'youtube' || source === 'instagram') setMode(source)
-        if (source === 'instagram') {
+        if (source === 'youtube') setMode('youtube')
+        if (source === 'instagram' && INSTAGRAM_ENABLED) {
+          setMode('instagram')
           setOutputFormat('mp4')
           if (/stories?\//i.test(text)) setIgKind('story')
           else setIgKind('reel')
@@ -230,6 +268,7 @@ export function HomePage() {
     abortRef.current = pullAbort
     if (mediaUrl) URL.revokeObjectURL(mediaUrl)
     setMediaUrl(null)
+    setReadyBlob(null)
     setPlaying(false)
     setCurrent(0)
     setDuration(0)
@@ -239,18 +278,17 @@ export function HomePage() {
     setProgressLabel('resolving media…')
 
     try {
+      // MP3 = download MP4 (works) → encode audio in the browser
+      const resolveOutput = 'mp4' as const
       const qualityValue =
-        outputFormat === 'mp4' ? selectedVideo.height : selectedAudio.kbps
-      let data = resolved
-      if (!data || data.platform !== mode) {
-        data = await resolveMedia({
-          url: url.trim(),
-          output: outputFormat,
-          quality: qualityValue,
-          signal: pullAbort.signal,
-        })
-        setResolved(data)
-      }
+        outputFormat === 'mp3' ? 720 : selectedVideo.height
+      const data = await resolveMedia({
+        url: url.trim(),
+        output: resolveOutput,
+        quality: qualityValue,
+        signal: pullAbort.signal,
+      })
+      setResolved(data)
 
       setProgress(8)
       setProgressLabel(
@@ -258,9 +296,9 @@ export function HomePage() {
           ? igKind === 'story'
             ? 'opening story…'
             : 'opening reel…'
-          : outputFormat === 'mp4'
-            ? 'grabbing video stream…'
-            : 'snatching audio stream…',
+          : outputFormat === 'mp3'
+            ? 'grabbing video for mp3…'
+            : 'grabbing video stream…',
       )
 
       const { blob, contentType } = await downloadWithProgress(
@@ -273,11 +311,11 @@ export function HomePage() {
       )
 
       let finalBlob = blob
-      let kind: 'audio' | 'video' = outputFormat === 'mp4' ? 'video' : 'audio'
+      let kind: 'audio' | 'video' = 'video'
 
       if (outputFormat === 'mp3') {
         setProgress(72)
-        setProgressLabel(`encoding ${selectedAudio.kbps}kbps mp3…`)
+        setProgressLabel(`mp4 → mp3 @ ${selectedAudio.kbps}kbps…`)
         try {
           finalBlob = await encodeToMp3(blob, {
             bitrateKbps: selectedAudio.kbps,
@@ -299,6 +337,7 @@ export function HomePage() {
 
       const objectUrl = URL.createObjectURL(finalBlob)
       setMediaUrl(objectUrl)
+      setReadyBlob(finalBlob)
       setMediaKind(kind)
       setProgress(100)
       setProgressLabel('locked. play anywhere.')
@@ -358,7 +397,7 @@ export function HomePage() {
       return
     }
     try {
-      const blob = await fetch(mediaUrl).then((r) => r.blob())
+      const blob = readyBlob || (await fetch(mediaUrl).then((r) => r.blob()))
       const file = new File([blob], `wavey.${outputFormat}`, {
         type: outputFormat === 'mp4' ? 'video/mp4' : 'audio/mpeg',
       })
@@ -369,6 +408,39 @@ export function HomePage() {
       })
     } catch {
       showErr(new WaveyError('share_cancel'))
+    }
+  }
+
+  /** Already have MP4? Strip audio → MP3 without re-downloading. */
+  const convertReadyVideoToMp3 = async () => {
+    if (!readyBlob || mediaKind !== 'video') return
+    setFriendlyError(null)
+    setStatus('ripping')
+    setProgress(72)
+    setProgressLabel(`mp4 → mp3 @ ${selectedAudio.kbps}kbps…`)
+    try {
+      const mp3 = await encodeToMp3(readyBlob, {
+        bitrateKbps: selectedAudio.kbps,
+        contentType: 'video/mp4',
+        filename: resolved?.filename || 'video.mp4',
+        onProgress: (pct) => setProgress(72 + Math.round(pct * 0.26)),
+      })
+      if (mediaUrl) URL.revokeObjectURL(mediaUrl)
+      const objectUrl = URL.createObjectURL(mp3)
+      setMediaUrl(objectUrl)
+      setReadyBlob(mp3)
+      setMediaKind('audio')
+      setOutputFormat('mp3')
+      setPlaying(false)
+      setCurrent(0)
+      setProgress(100)
+      setProgressLabel('locked. play anywhere.')
+      setStatus('ready')
+      showOk('mp3 ready')
+    } catch (err) {
+      setStatus('ready')
+      setProgress(100)
+      showErr(err)
     }
   }
 
@@ -386,7 +458,16 @@ export function HomePage() {
                 <Link className="rw-nav-link" to="/how-it-works">
                   How it works
                 </Link>
-                <span className="rw-pill">live</span>
+                <span
+                  className={`rw-pill ${apiOnline === false ? 'is-down' : ''}`}
+                  title={
+                    apiOnline === false
+                      ? 'convert api offline — restart npm run dev'
+                      : 'convert api reachable'
+                  }
+                >
+                  {apiOnline === false ? 'api offline' : apiOnline ? 'api live' : 'checking…'}
+                </span>
               </div>
             </div>
 
@@ -399,7 +480,7 @@ export function HomePage() {
               <p className="rw-hero-lead">
                 Convert <strong>YouTube</strong> to clean <strong>MP3</strong> or
                 high-quality <strong>MP4</strong>, and save{' '}
-                <strong>Instagram reels & stories</strong>. Built for phone,
+                Instagram reels soon. Built for phone,
                 desktop, and webview — no sketchy redirects.
               </p>
               <div className="rw-trust-row" aria-label="Trust signals">
@@ -438,12 +519,20 @@ export function HomePage() {
                 YouTube
               </button>
               <button
-                className="rw-mode"
+                className={`rw-mode${!INSTAGRAM_ENABLED ? ' is-soon' : ''}`}
                 role="tab"
                 aria-pressed={mode === 'instagram'}
+                aria-disabled={!INSTAGRAM_ENABLED}
+                disabled={!INSTAGRAM_ENABLED}
+                title={!INSTAGRAM_ENABLED ? 'Instagram coming soon' : undefined}
                 onClick={() => switchMode('instagram')}
               >
-                Instagram
+                <span>Instagram</span>
+                {!INSTAGRAM_ENABLED && (
+                  <span className="rw-soon-tag" aria-hidden="true">
+                    coming soon
+                  </span>
+                )}
               </button>
             </div>
 
@@ -462,11 +551,14 @@ export function HomePage() {
                     setStatus('idle')
                     setResolved(null)
                     setFriendlyError(null)
-                    if (/instagram\.com\/stories?\//i.test(next)) {
+                    if (INSTAGRAM_ENABLED && /instagram\.com\/stories?\//i.test(next)) {
                       setMode('instagram')
                       setIgKind('story')
                       setOutputFormat('mp4')
-                    } else if (/instagram\.com\/(reel|reels)\//i.test(next)) {
+                    } else if (
+                      INSTAGRAM_ENABLED &&
+                      /instagram\.com\/(reel|reels)\//i.test(next)
+                    ) {
                       setMode('instagram')
                       setIgKind('reel')
                       setOutputFormat('mp4')
@@ -809,6 +901,15 @@ export function HomePage() {
                   <button type="button" className="rw-btn primary" onClick={downloadFile}>
                     Download {outputFormat.toUpperCase()}
                   </button>
+                  {mediaKind === 'video' && (
+                    <button
+                      type="button"
+                      className="rw-btn"
+                      onClick={() => void convertReadyVideoToMp3()}
+                    >
+                      Convert to MP3
+                    </button>
+                  )}
                   <button type="button" className="rw-btn" onClick={() => void shareFile()}>
                     Share
                   </button>

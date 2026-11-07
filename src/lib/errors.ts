@@ -38,8 +38,8 @@ export type FriendlyError = {
 const COPY: Record<WaveyErrorCode, Omit<FriendlyError, 'code'>> = {
   api_down: {
     title: 'api ghosted us',
-    message: 'wavey can’t reach the convert backend on port 8787.',
-    hint: 'in the project folder run: npm run dev — wait until you see [wavey-api].',
+    message: 'the page loaded, but /api didn’t answer from this tab.',
+    hint: 'use http://127.0.0.1:5173 · hard refresh (Ctrl+Shift+R) · or try Incognito (Chrome extensions often block convert).',
   },
   api_timeout: {
     title: 'that took forever',
@@ -49,7 +49,7 @@ const COPY: Record<WaveyErrorCode, Omit<FriendlyError, 'code'>> = {
   api_bad_gateway: {
     title: 'backend hiccup',
     message: 'the convert api dropped the connection mid-pull.',
-    hint: 'keep npm run dev running (look for [wavey-api] on :8787), then pull again.',
+    hint: 'hard refresh, keep npm run dev running, retry once.',
   },
   network: {
     title: 'no signal',
@@ -94,7 +94,7 @@ const COPY: Record<WaveyErrorCode, Omit<FriendlyError, 'code'>> = {
   yt_unavailable: {
     title: 'youtube said no',
     message: 'couldn’t load that video’s streams.',
-    hint: 'retry once. if it keeps failing, the video may be restricted.',
+    hint: 'hard refresh, retry once — try 720p or a short public clip.',
   },
   yt_decipher: {
     title: 'stream fumbled',
@@ -133,8 +133,8 @@ const COPY: Record<WaveyErrorCode, Omit<FriendlyError, 'code'>> = {
   },
   download_fail: {
     title: 'download flopped',
-    message: 'we couldn’t stream the file all the way.',
-    hint: 'retry. if it’s huge, drop to 720p / lower bitrate.',
+    message: 'the pull didn’t finish cleanly.',
+    hint: 'hard refresh http://127.0.0.1:5173 · Incognito if extensions mess with fetch · try a short clip / 720p.',
   },
   encode_fail: {
     title: 'mp3 encode fumbled',
@@ -219,12 +219,15 @@ export function toWaveyError(input: unknown, status?: number): WaveyError {
   if (st === 504 || includesAny(msg, ['timeout', 'timed out', 'aborted'])) {
     return new WaveyError('api_timeout', st)
   }
+  if (includesAny(msg, ['stream interrupted', 'blocked by browser', 'download flopped'])) {
+    return new WaveyError('download_fail', st || 0)
+  }
   if (
     st === 503 ||
     st === 0 ||
     includesAny(msg, [
       'api unavailable',
-      'cannot reach',
+      'cannot reach /api/resolve',
       'failed to fetch',
       'networkerror',
       'econnrefused',
@@ -243,6 +246,16 @@ export function toWaveyError(input: unknown, status?: number): WaveyError {
     return new WaveyError('token_invalid', st)
   }
 
+  if (st === 404 || includesAny(msg, ['not found', 'no route'])) {
+    return new WaveyError('api_down', st, 'wrong url/port — use the app UI on :5173')
+  }
+  if (st === 405 || includesAny(msg, ['post from the wavey app', 'get only', 'bad_method'])) {
+    return new WaveyError(
+      'generic',
+      st,
+      'open http://localhost:5173 and paste the link in the app (not the API port)',
+    )
+  }
   if (includesAny(msg, ['only youtube and instagram', 'unsupported'])) {
     return new WaveyError('unsupported_host', st)
   }
@@ -268,7 +281,19 @@ export function toWaveyError(input: unknown, status?: number): WaveyError {
   if (includesAny(msg, ['no valid url to decipher', 'decipher', 'yt_cookie'])) {
     return new WaveyError('yt_decipher', st)
   }
-  if (includesAny(msg, ['youtube', 'innertube', 'no streams', 'streaming'])) {
+  if (
+    includesAny(msg, [
+      'non 2xx',
+      'fetch_failed',
+      'no matching formats',
+      'youtube ghosted',
+      'youtube',
+      'innertube',
+      'no streams',
+      'streaming',
+      'upstream fetch failed',
+    ])
+  ) {
     return new WaveyError('yt_unavailable', st)
   }
 
