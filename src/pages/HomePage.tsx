@@ -3,7 +3,14 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { Link } from 'react-router-dom'
 import { downloadWithProgress, resolveMedia, type ResolveResponse } from '../lib/api'
 import { encodeToMp3 } from '../lib/encodeMp3'
+import {
+  friendlyFromUnknown,
+  toWaveyError,
+  type FriendlyError,
+  WaveyError,
+} from '../lib/errors'
 import { detectSource } from '../lib/source'
+import { ErrorBanner } from '../components/ErrorBanner'
 import { LinkPreview } from '../components/LinkPreview'
 import { RealisticWave } from '../components/RealisticWave'
 
@@ -69,12 +76,19 @@ export function HomePage() {
   const [mediaUrl, setMediaUrl] = useState<string | null>(null)
   const [mediaKind, setMediaKind] = useState<'audio' | 'video'>('audio')
   const [resolved, setResolved] = useState<ResolveResponse | null>(null)
-  const [resolveError, setResolveError] = useState<string | null>(null)
+  const [friendlyError, setFriendlyError] = useState<FriendlyError | null>(null)
   const [resolving, setResolving] = useState(false)
   const [playing, setPlaying] = useState(false)
   const [current, setCurrent] = useState(0)
   const [duration, setDuration] = useState(0)
-  const [toast, setToast] = useState<string | null>(null)
+  const [toast, setToast] = useState<{ text: string; kind: 'ok' | 'err' } | null>(null)
+
+  const showOk = (text: string) => setToast({ text, kind: 'ok' })
+  const showErr = (err: unknown) => {
+    const friendly = friendlyFromUnknown(err)
+    setFriendlyError(friendly)
+    setToast({ text: `${friendly.title} — ${friendly.message}`, kind: 'err' })
+  }
 
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -112,7 +126,8 @@ export function HomePage() {
 
   useEffect(() => {
     if (!toast) return
-    const id = window.setTimeout(() => setToast(null), 2400)
+    const ms = toast.kind === 'err' ? 4200 : 2400
+    const id = window.setTimeout(() => setToast(null), ms)
     return () => window.clearTimeout(id)
   }, [toast])
 
@@ -127,7 +142,7 @@ export function HomePage() {
     const timer = window.setTimeout(() => {
       void (async () => {
         setResolving(true)
-        setResolveError(null)
+        setFriendlyError(null)
         try {
           const qualityValue =
             outputFormat === 'mp4' ? selectedVideo.height : selectedAudio.kbps
@@ -135,16 +150,19 @@ export function HomePage() {
             url: trimmed,
             output: outputFormat,
             quality: qualityValue,
+            signal: controller.signal,
           })
           if (controller.signal.aborted) return
           setResolved(data)
+          setFriendlyError(null)
           if (data.platform === 'instagram') {
             setIgKind(data.isStory || /story/i.test(data.kindLabel) ? 'story' : 'reel')
           }
         } catch (err) {
           if (controller.signal.aborted) return
+          if (err instanceof DOMException && err.name === 'AbortError') return
           setResolved(null)
-          setResolveError(err instanceof Error ? err.message : 'Could not resolve link')
+          setFriendlyError(friendlyFromUnknown(err))
         } finally {
           if (!controller.signal.aborted) setResolving(false)
         }
@@ -163,7 +181,7 @@ export function HomePage() {
     setProgress(0)
     setPlaying(false)
     setResolved(null)
-    setResolveError(null)
+    setFriendlyError(null)
     if (next === 'instagram') setOutputFormat('mp4')
     audioRef.current?.pause()
     videoRef.current?.pause()
@@ -181,10 +199,10 @@ export function HomePage() {
           if (/stories?\//i.test(text)) setIgKind('story')
           else setIgKind('reel')
         }
-        setToast('link locked in')
+        showOk('link locked in')
       }
     } catch {
-      setToast('allow clipboard paste')
+      showErr(new WaveyError('clipboard'))
     }
   }
 
@@ -203,16 +221,19 @@ export function HomePage() {
   const ripIt = async () => {
     if (!canRip) return
     if (detected && detected !== 'unknown' && detected !== mode) {
-      setToast(`that looks like ${detected} — switch tabs`)
+      showErr(new WaveyError('wrong_platform'))
       return
     }
 
     abortRef.current?.abort()
+    const pullAbort = new AbortController()
+    abortRef.current = pullAbort
     if (mediaUrl) URL.revokeObjectURL(mediaUrl)
     setMediaUrl(null)
     setPlaying(false)
     setCurrent(0)
     setDuration(0)
+    setFriendlyError(null)
     setStatus('ripping')
     setProgress(2)
     setProgressLabel('resolving media…')
@@ -226,6 +247,7 @@ export function HomePage() {
           url: url.trim(),
           output: outputFormat,
           quality: qualityValue,
+          signal: pullAbort.signal,
         })
         setResolved(data)
       }
@@ -241,10 +263,14 @@ export function HomePage() {
             : 'snatching audio stream…',
       )
 
-      const { blob, contentType } = await downloadWithProgress(data.token, (pct) => {
-        setProgress(Math.max(8, Math.min(70, pct * 0.7)))
-        setProgressLabel('downloading…')
-      })
+      const { blob, contentType } = await downloadWithProgress(
+        data.token,
+        (pct) => {
+          setProgress(Math.max(8, Math.min(70, pct * 0.7)))
+          setProgressLabel('downloading…')
+        },
+        pullAbort.signal,
+      )
 
       let finalBlob = blob
       let kind: 'audio' | 'video' = outputFormat === 'mp4' ? 'video' : 'audio'
@@ -252,17 +278,21 @@ export function HomePage() {
       if (outputFormat === 'mp3') {
         setProgress(72)
         setProgressLabel(`encoding ${selectedAudio.kbps}kbps mp3…`)
-        finalBlob = await encodeToMp3(blob, {
-          bitrateKbps: selectedAudio.kbps,
-          contentType,
-          filename: data.filename,
-          onProgress: (pct) => {
-            setProgress(72 + Math.round(pct * 0.26))
-          },
-        })
+        try {
+          finalBlob = await encodeToMp3(blob, {
+            bitrateKbps: selectedAudio.kbps,
+            contentType,
+            filename: data.filename,
+            onProgress: (pct) => {
+              setProgress(72 + Math.round(pct * 0.26))
+            },
+          })
+        } catch (encodeErr) {
+          throw toWaveyError(encodeErr instanceof Error ? encodeErr.message : 'mp3 encode failed')
+        }
         kind = 'audio'
       } else if (!contentType.startsWith('video/') && contentType.startsWith('image/')) {
-        throw new Error('This post is an image, not a video')
+        throw new WaveyError('image_not_video')
       } else {
         kind = contentType.startsWith('video/') ? 'video' : 'audio'
       }
@@ -273,7 +303,7 @@ export function HomePage() {
       setProgress(100)
       setProgressLabel('locked. play anywhere.')
       setStatus('ready')
-      setToast(
+      showOk(
         mode === 'instagram'
           ? igKind === 'story'
             ? 'story ready'
@@ -283,11 +313,14 @@ export function HomePage() {
             : 'mp3 ready',
       )
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setStatus('idle')
+        setProgress(0)
+        return
+      }
       setStatus('idle')
       setProgress(0)
-      const message = err instanceof Error ? err.message : 'Pull failed'
-      setToast(message)
-      setResolveError(message)
+      showErr(err)
     }
   }
 
@@ -316,12 +349,12 @@ export function HomePage() {
           : `wavey-${quality}-${selectedAudio.kbps}kbps.${ext}`
         : `wavey-${igKind}.${ext}`)
     a.click()
-    setToast(`${ext} download started`)
+    showOk(`${ext} download started`)
   }
 
   const shareFile = async () => {
     if (!mediaUrl || !navigator.share) {
-      setToast('share sheet not on this device')
+      showErr(new WaveyError('share_unsupported'))
       return
     }
     try {
@@ -335,7 +368,7 @@ export function HomePage() {
         files: [file],
       })
     } catch {
-      setToast('share cancelled')
+      showErr(new WaveyError('share_cancel'))
     }
   }
 
@@ -428,6 +461,7 @@ export function HomePage() {
                     setUrl(next)
                     setStatus('idle')
                     setResolved(null)
+                    setFriendlyError(null)
                     if (/instagram\.com\/stories?\//i.test(next)) {
                       setMode('instagram')
                       setIgKind('story')
@@ -460,12 +494,19 @@ export function HomePage() {
                   ⎘
                 </button>
               </div>
-              {resolveError ? (
-                <p className="rw-hint warn">{resolveError}</p>
-              ) : detectingHint(detected, mode, resolving)}
+              {detectingHint(detected, mode, resolving, Boolean(friendlyError))}
 
               <AnimatePresence>
-                {url.trim().length > 8 && (
+                {friendlyError && (
+                  <ErrorBanner
+                    error={friendlyError}
+                    onDismiss={() => setFriendlyError(null)}
+                  />
+                )}
+              </AnimatePresence>
+
+              <AnimatePresence>
+                {url.trim().length > 8 && !friendlyError && (
                   <LinkPreview
                     data={{
                       platform: detected === 'unknown' || !detected ? mode : detected,
@@ -780,6 +821,7 @@ export function HomePage() {
                     setUrl('')
                     setPlaying(false)
                     setResolved(null)
+                    setFriendlyError(null)
                   }}
                 >
                   PULL ANOTHER
@@ -800,12 +842,12 @@ export function HomePage() {
       <AnimatePresence>
         {toast && (
           <motion.div
-            className="rw-toast"
+            className={`rw-toast ${toast.kind === 'err' ? 'is-error' : ''}`}
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 8 }}
           >
-            {toast}
+            {toast.text}
           </motion.div>
         )}
       </AnimatePresence>
@@ -817,8 +859,10 @@ function detectingHint(
   detected: ReturnType<typeof detectSource> | null,
   mode: Mode,
   resolving: boolean,
+  hasError: boolean,
 ) {
-  if (resolving) return <p className="rw-hint ok">resolving metadata…</p>
+  if (hasError) return null
+  if (resolving) return <p className="rw-hint ok">locking the vibe…</p>
   if (detected && detected !== 'unknown' && detected !== mode) {
     return (
       <p className="rw-hint warn">

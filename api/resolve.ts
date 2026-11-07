@@ -1,4 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
+import { friendlyApiError } from './_lib/friendly.js'
 import { handleOptions, readJsonBody, sendError, sendJson } from './_lib/http.js'
 import { resolveInstagram } from './_lib/instagram.js'
 import { clientIp, rateLimit } from './_lib/rateLimit.js'
@@ -116,7 +117,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         'Instagram serves one rendered file — effects, captions, and audio are baked in as posted.',
     })
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Resolve failed'
-    sendError(res, 400, message)
+    const friendly = friendlyApiError(err)
+    sendError(res, 400, friendly.error, { code: friendly.code, hint: friendly.hint })
   }
 }

@@ -20,8 +20,18 @@ export function sendJson(res: VercelResponse, status: number, body: unknown) {
   res.status(status).json(body)
 }
 
-export function sendError(res: VercelResponse, status: number, message: string) {
-  sendJson(res, status, { ok: false, error: message })
+export function sendError(
+  res: VercelResponse,
+  status: number,
+  message: string,
+  extra?: { code?: string; hint?: string },
+) {
+  sendJson(res, status, {
+    ok: false,
+    error: message,
+    ...(extra?.code ? { code: extra.code } : {}),
+    ...(extra?.hint ? { hint: extra.hint } : {}),
+  })
 }
 
 export async function readJsonBody<T>(req: VercelRequest): Promise<T> {

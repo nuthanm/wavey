@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { friendlyApiError } from './_lib/friendly.js'
 import { handleOptions, sendError, setCors } from './_lib/http.js'
 import { igFetchHeaders } from './_lib/instagram.js'
 import { clientIp, rateLimit } from './_lib/rateLimit.js'
@@ -92,9 +93,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     await pipeline(nodeStreamFromWeb(upstream.body), res)
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Stream failed'
+    const friendly = friendlyApiError(err)
     if (!res.headersSent) {
-      sendError(res, 400, message)
+      sendError(res, 400, friendly.error, { code: friendly.code, hint: friendly.hint })
     } else {
       res.destroy(err instanceof Error ? err : undefined)
     }

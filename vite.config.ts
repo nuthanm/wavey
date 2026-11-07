@@ -13,6 +13,8 @@ export default defineConfig(({ mode }) => {
         '/api': {
           target: `http://127.0.0.1:${apiPort}`,
           changeOrigin: true,
+          timeout: 180_000,
+          proxyTimeout: 180_000,
         },
       },
     },

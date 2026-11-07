@@ -1,3 +1,5 @@
+import { toWaveyError, WaveyError } from './errors'
+
 export type ResolveResponse = {
   ok: true
   platform: 'youtube' | 'instagram'
@@ -19,22 +21,28 @@ export type ResolveResponse = {
 export type ResolveError = {
   ok: false
   error: string
+  code?: string
+  hint?: string
 }
 
 async function readJsonSafe(res: Response): Promise<unknown> {
   const text = await res.text()
   if (!text.trim()) {
-    throw new Error(
-      res.ok
-        ? 'Empty response from API'
-        : `API unavailable (${res.status}). Run npm run dev so the local API starts on port 8787.`,
+    throw toWaveyError(
+      res.status === 502
+        ? '502 bad gateway'
+        : res.status >= 500
+          ? `API unavailable (${res.status})`
+          : 'Empty response from API',
+      res.status,
     )
   }
   try {
     return JSON.parse(text) as unknown
   } catch {
-    throw new Error(
-      `API returned non-JSON (${res.status}). Is the Wavey API running? Use npm run dev (UI + API).`,
+    throw toWaveyError(
+      res.status === 502 ? '502 bad gateway' : `API returned non-JSON (${res.status})`,
+      res.status,
     )
   }
 }
@@ -43,6 +51,7 @@ export async function resolveMedia(input: {
   url: string
   output: 'mp3' | 'mp4'
   quality: number
+  signal?: AbortSignal
 }): Promise<ResolveResponse> {
   let res: Response
   try {
@@ -50,20 +59,24 @@ export async function resolveMedia(input: {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
+      signal: input.signal,
     })
-  } catch {
-    throw new Error(
-      'Cannot reach /api/resolve. Start the app with npm run dev (starts UI + local API).',
-    )
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err
+    throw toWaveyError('Cannot reach /api/resolve', 0)
   }
 
   const data = (await readJsonSafe(res)) as ResolveResponse | ResolveError
   if (!res.ok || !data || typeof data !== 'object' || !('ok' in data) || !data.ok) {
-    const message =
+    const serverMsg =
       data && typeof data === 'object' && 'error' in data && typeof data.error === 'string'
         ? data.error
         : `Resolve failed (${res.status})`
-    throw new Error(message)
+    const err = toWaveyError(serverMsg, res.status)
+    if (data && typeof data === 'object' && 'hint' in data && typeof data.hint === 'string') {
+      err.hint = data.hint
+    }
+    throw err
   }
   return data
 }
@@ -75,23 +88,27 @@ export function streamUrl(token: string): string {
 export async function downloadWithProgress(
   token: string,
   onProgress: (pct: number) => void,
+  signal?: AbortSignal,
 ): Promise<{ blob: Blob; contentType: string }> {
   let res: Response
   try {
-    res = await fetch(streamUrl(token))
-  } catch {
-    throw new Error('Cannot reach /api/stream. Is npm run dev still running?')
+    res = await fetch(streamUrl(token), { signal })
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err
+    throw toWaveyError('Cannot reach /api/stream', 0)
   }
 
   if (!res.ok) {
     let message = `Download failed (${res.status})`
     try {
       const err = (await readJsonSafe(res)) as { error?: string }
-      if (err.error) message = err.error
+      if (err && typeof err === 'object' && 'error' in err && err.error) {
+        message = String(err.error)
+      }
     } catch (e) {
-      if (e instanceof Error && !e.message.startsWith('Download')) message = e.message
+      if (e instanceof WaveyError) throw e
     }
-    throw new Error(message)
+    throw toWaveyError(message, res.status)
   }
 
   const contentType = res.headers.get('content-type') || 'application/octet-stream'
@@ -105,18 +122,23 @@ export async function downloadWithProgress(
 
   const chunks: Uint8Array[] = []
   let received = 0
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    if (value) {
-      chunks.push(value)
-      received += value.byteLength
-      if (total > 0) {
-        onProgress(Math.min(95, Math.round((received / total) * 95)))
-      } else {
-        onProgress(Math.min(90, 10 + Math.round(Math.log10(received + 10) * 12)))
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value) {
+        chunks.push(value)
+        received += value.byteLength
+        if (total > 0) {
+          onProgress(Math.min(95, Math.round((received / total) * 95)))
+        } else {
+          onProgress(Math.min(90, 10 + Math.round(Math.log10(received + 10) * 12)))
+        }
       }
     }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err
+    throw toWaveyError('download stream interrupted', res.status)
   }
 
   const blob = new Blob(chunks as BlobPart[], { type: contentType })

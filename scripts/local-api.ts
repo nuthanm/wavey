@@ -30,6 +30,7 @@ function loadEnvFile(filename: string) {
 
 loadEnvFile('.env.local')
 loadEnvFile('.env')
+import { friendlyApiError } from '../api/_lib/friendly.ts'
 import { resolveInstagram, igFetchHeaders } from '../api/_lib/instagram.ts'
 import { clientIp, rateLimit } from '../api/_lib/rateLimit.ts'
 import { signToken, verifyToken } from '../api/_lib/token.ts'
@@ -57,8 +58,23 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown) {
   res.end(payload)
 }
 
-function sendError(res: http.ServerResponse, status: number, message: string) {
-  sendJson(res, status, { ok: false, error: message })
+function sendError(
+  res: http.ServerResponse,
+  status: number,
+  message: string,
+  extra?: { code?: string; hint?: string },
+) {
+  sendJson(res, status, {
+    ok: false,
+    error: message,
+    ...(extra?.code ? { code: extra.code } : {}),
+    ...(extra?.hint ? { hint: extra.hint } : {}),
+  })
+}
+
+function sendFriendly(res: http.ServerResponse, status: number, err: unknown) {
+  const friendly = friendlyApiError(err)
+  sendError(res, status, friendly.error, { code: friendly.code, hint: friendly.hint })
 }
 
 async function readBody(req: http.IncomingMessage): Promise<string> {
@@ -164,7 +180,7 @@ async function handleResolve(req: http.IncomingMessage, res: http.ServerResponse
       note: 'Instagram serves one rendered file — effects, captions, and audio are baked in as posted.',
     })
   } catch (err) {
-    sendError(res, 400, err instanceof Error ? err.message : 'Resolve failed')
+    sendFriendly(res, 400, err)
   }
 }
 
@@ -247,8 +263,7 @@ async function handleStream(req: http.IncomingMessage, res: http.ServerResponse)
     res.writeHead(200, head)
     await pipeline(nodeStreamFromWeb(upstream.body), res)
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Stream failed'
-    if (!res.headersSent) sendError(res, 400, message)
+    if (!res.headersSent) sendFriendly(res, 400, err)
     else res.destroy(err instanceof Error ? err : undefined)
   }
 }
