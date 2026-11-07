@@ -403,7 +403,7 @@ export function HomePage() {
       return
     }
     try {
-      const blob = readyBlob || (await fetch(mediaUrl).then((r) => r.blob()))
+      const blob: Blob = readyBlob ?? (await fetch(mediaUrl).then((r) => r.blob()))
       const file = new File([blob], `wavey.${outputFormat}`, {
         type: outputFormat === 'mp4' ? 'video/mp4' : 'audio/mpeg',
       })

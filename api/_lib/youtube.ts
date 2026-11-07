@@ -132,7 +132,7 @@ export function youtubeOutputHints(
   }
 }
 
-function videoQualityFallbacks(height: number): Array<string | number> {
+function videoQualityFallbacks(height: number): string[] {
   const label = videoQualityLabel(height)
   const ladder = ['2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p']
   const idx = ladder.indexOf(label)
@@ -252,9 +252,7 @@ export async function downloadYoutubeStream(
   }
 
   const qualities =
-    opts.kind === 'audio'
-      ? (['best'] as Array<string | number>)
-      : videoQualityFallbacks(opts.quality)
+    opts.kind === 'audio' ? ['best'] : videoQualityFallbacks(opts.quality)
 
   let lastErr: unknown
   for (const client of CLIENTS) {

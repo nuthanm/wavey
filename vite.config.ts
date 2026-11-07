@@ -1,6 +1,6 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
-import { waveyApiPlugin } from './scripts/vite-wavey-api'
+import { waveyApiPlugin } from './scripts/vite-wavey-api.ts'
 
 // https://vite.dev/config/
 export default defineConfig({
