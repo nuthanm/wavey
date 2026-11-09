@@ -4,9 +4,12 @@ import type { FriendlyError } from '../lib/errors'
 type Props = {
   error: FriendlyError
   onDismiss?: () => void
+  /** Optional recovery action the UI can offer (e.g. switch to Upload). */
+  actionLabel?: string
+  onAction?: () => void
 }
 
-export function ErrorBanner({ error, onDismiss }: Props) {
+export function ErrorBanner({ error, onDismiss, actionLabel, onAction }: Props) {
   return (
     <motion.div
       className="rw-error-banner"
@@ -26,6 +29,11 @@ export function ErrorBanner({ error, onDismiss }: Props) {
       </div>
       <p>{error.message}</p>
       {error.hint && <p className="rw-error-hint">{error.hint}</p>}
+      {actionLabel && onAction && (
+        <button type="button" className="rw-error-action" onClick={onAction}>
+          {actionLabel}
+        </button>
+      )}
     </motion.div>
   )
 }

@@ -85,8 +85,8 @@ const COPY: Record<WaveyErrorCode, Omit<FriendlyError, 'code'>> = {
   },
   yt_age: {
     title: 'age-gated, not today',
-    message: 'youtube is gatekeeping this video.',
-    hint: 'try a public track, or set YT_COOKIE on the server.',
+    message: 'youtube won’t hand this video to anonymous pulls.',
+    hint: 'switch to Upload if you already have the file, or try a public (non age-restricted) link. The site can’t sign into YouTube for you.',
   },
   yt_region: {
     title: 'geo blocked',
@@ -101,7 +101,7 @@ const COPY: Record<WaveyErrorCode, Omit<FriendlyError, 'code'>> = {
   yt_decipher: {
     title: 'stream fumbled',
     message: 'couldn’t unlock the download url.',
-    hint: 'hit pull again. still broken? set YT_COOKIE in .env.local.',
+    hint: 'hit pull again. still stuck? try Upload with a file you already have, or another public link.',
   },
   ig_private: {
     title: 'private reel energy',
@@ -278,8 +278,22 @@ export function toWaveyError(input: unknown, status?: number): WaveyError {
     return new WaveyError('wrong_platform', st)
   }
 
-  if (includesAny(msg, ['age', 'sign in to confirm', 'confirm your age'])) {
-    return new WaveyError('yt_age', st)
+  if (
+    includesAny(msg, [
+      'age',
+      'sign in to confirm',
+      'confirm your age',
+      'age-restricted',
+      'login_required',
+      'login required',
+    ])
+  ) {
+    const err = new WaveyError('yt_age', st)
+    if (includesAny(msg, ['stale', 'cookie may be stale'])) {
+      err.hint =
+        'server YouTube session looks stale — refresh it on the host, or use Upload with a local file.'
+    }
+    return err
   }
   if (includesAny(msg, ['not available in your country', 'region', 'geo'])) {
     return new WaveyError('yt_region', st)

@@ -1,5 +1,6 @@
 import { Innertube, UniversalCache } from 'youtubei.js'
 import { extractYoutubeId, formatDuration, sanitizeFilename } from './validate.js'
+import { getYtCookie } from './ytCookie.js'
 
 export type ResolvedMedia = {
   platform: 'youtube'
@@ -59,10 +60,19 @@ function resetTube() {
 
 async function getTube(): Promise<Innertube> {
   if (!innertubePromise) {
+    const cookie = getYtCookie()
     innertubePromise = Innertube.create({
       cache: new UniversalCache(false),
       retrieve_player: true,
-      cookie: process.env.YT_COOKIE || undefined,
+      cookie,
+      // Keep Origin consistent so SAPISIDHASH auth is accepted
+      fetch: async (input, init) => {
+        const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : undefined))
+        if (cookie && !headers.has('Cookie')) headers.set('Cookie', cookie)
+        if (!headers.has('Origin')) headers.set('Origin', 'https://www.youtube.com')
+        if (!headers.has('Referer')) headers.set('Referer', 'https://www.youtube.com/')
+        return fetch(input, { ...init, headers })
+      },
     }).catch((err) => {
       innertubePromise = null
       throw err
@@ -83,23 +93,90 @@ function pickThumb(info: {
   return id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : null
 }
 
-const CLIENTS = ['ANDROID', 'IOS', 'TV', 'WEB'] as const
+/** Anonymous clients that sometimes unlock age gates without a cookie. */
+const ANON_CLIENTS = [
+  'TV_EMBEDDED',
+  'TV',
+  'ANDROID_VR',
+  'ANDROID',
+  'IOS',
+  'WEB_EMBEDDED',
+  'MWEB',
+  'WEB',
+] as const
+
+/** With a logged-in cookie, prefer WEB so SAPISIDHASH auth is applied. */
+const AUTH_CLIENTS = [
+  'WEB',
+  'MWEB',
+  'TV_EMBEDDED',
+  'TV',
+  'ANDROID',
+  'IOS',
+  'WEB_EMBEDDED',
+  'ANDROID_VR',
+] as const
+
+function clientLadder() {
+  return getYtCookie() ? AUTH_CLIENTS : ANON_CLIENTS
+}
+
+function playabilityOk(info: {
+  playability_status?: { status?: string | null; reason?: string | null } | null
+  streaming_data?: { formats?: unknown[]; adaptive_formats?: unknown[] } | null
+}): boolean {
+  const status = info.playability_status?.status
+  if (!status || status === 'OK') return true
+  const formats = info.streaming_data?.formats?.length || 0
+  const adaptive = info.streaming_data?.adaptive_formats?.length || 0
+  // Some clients return LOGIN_REQUIRED but still attach streams
+  return formats + adaptive > 0
+}
+
+function isAgeOrLoginGate(msg: string): boolean {
+  return /age|confirm your age|sign in to confirm|login_required|login required/i.test(msg)
+}
 
 async function getInfo(videoId: string) {
   let lastErr: unknown
+  let ageGateReason: string | null = null
+
   for (let attempt = 0; attempt < 2; attempt++) {
     const tube = await getTube()
-    for (const client of CLIENTS) {
+    for (const client of clientLadder()) {
       try {
-        return await tube.getBasicInfo(videoId, { client })
+        const info = await tube.getBasicInfo(videoId, { client })
+        if (playabilityOk(info)) return info
+
+        const reason =
+          info.playability_status?.reason ||
+          info.playability_status?.status ||
+          'Video is not playable'
+        if (isAgeOrLoginGate(String(reason))) {
+          ageGateReason = String(reason)
+          lastErr = new Error(reason)
+          continue
+        }
+        lastErr = new Error(reason)
       } catch (err) {
         lastErr = err
         const msg = err instanceof Error ? err.message : String(err)
+        if (isAgeOrLoginGate(msg)) ageGateReason = msg
         if (/non 2xx|fetch_failed/i.test(msg)) resetTube()
       }
     }
     resetTube()
   }
+
+  if (ageGateReason) {
+    const hasCookie = Boolean(getYtCookie())
+    throw new Error(
+      hasCookie
+        ? `Age-restricted video still blocked (cookie may be stale): ${ageGateReason}`
+        : `Age-restricted — YouTube requires a signed-in session for this video (${ageGateReason})`,
+    )
+  }
+
   throw lastErr instanceof Error ? lastErr : new Error('Failed to load YouTube info')
 }
 
@@ -109,9 +186,17 @@ export async function resolveYoutube(sourceUrl: string): Promise<ResolvedMedia> 
   if (!videoId) throw new Error('Could not parse YouTube video id')
 
   const info = await getInfo(videoId)
-  const status = info.playability_status?.status
-  if (status && status !== 'OK') {
-    throw new Error(info.playability_status?.reason || 'Video is not playable')
+  if (!playabilityOk(info)) {
+    const reason = info.playability_status?.reason || info.playability_status?.status || 'Video is not playable'
+    if (isAgeOrLoginGate(String(reason))) {
+      const hasCookie = Boolean(getYtCookie())
+      throw new Error(
+        hasCookie
+          ? `Age-restricted video still blocked (cookie may be stale): ${reason}`
+          : `Age-restricted — YouTube requires a signed-in session for this video (${reason})`,
+      )
+    }
+    throw new Error(String(reason))
   }
 
   const title = info.basic_info.title || 'YouTube video'
@@ -201,7 +286,7 @@ async function decipherUrl(
     }
   }
   if (!mediaUrl) {
-    throw new Error('No valid URL to decipher — try again or set YT_COOKIE')
+    throw new Error('No valid URL to decipher — try again')
   }
   return mediaUrl
 }
@@ -445,7 +530,7 @@ export async function downloadYoutubeStream(
     downloadKind === 'audio' ? ['best'] : videoQualityFallbacks(opts.quality)
 
   let lastErr: unknown
-  for (const client of CLIENTS) {
+  for (const client of clientLadder()) {
     for (const quality of qualities) {
       try {
         const stream = await tube.download(meta.videoId, {

@@ -344,11 +344,15 @@ const server = http.createServer((req, res) => {
         sendError(res, 405, 'health is GET only', { code: 'bad_method' })
         return
       }
+      const { ytCookieStatus } = await import('../api/_lib/ytCookie.ts')
+      const yt = ytCookieStatus(process.env.YT_COOKIE)
       sendJson(res, 200, {
         ok: true,
         service: 'wavey-local',
         storiesConfigured: Boolean(process.env.IG_SESSIONID),
-        youtubeCookie: Boolean(process.env.YT_COOKIE),
+        youtubeCookie: yt.configured,
+        youtubeCookieUsable: yt.usable,
+        ageRestrictedUnlocked: yt.usable,
         tokenSecret: Boolean(process.env.WAVEY_TOKEN_SECRET),
       })
       return

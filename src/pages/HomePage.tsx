@@ -824,6 +824,25 @@ export function HomePage() {
                   <ErrorBanner
                     error={friendlyError}
                     onDismiss={() => setFriendlyError(null)}
+                    actionLabel={
+                      friendlyError.code === 'yt_age' ||
+                      friendlyError.code === 'yt_private' ||
+                      friendlyError.code === 'yt_unavailable' ||
+                      friendlyError.code === 'yt_decipher'
+                        ? 'Switch to Upload'
+                        : undefined
+                    }
+                    onAction={
+                      friendlyError.code === 'yt_age' ||
+                      friendlyError.code === 'yt_private' ||
+                      friendlyError.code === 'yt_unavailable' ||
+                      friendlyError.code === 'yt_decipher'
+                        ? () => {
+                            setFriendlyError(null)
+                            switchMode('upload')
+                          }
+                        : undefined
+                    }
                   />
                 )}
               </AnimatePresence>

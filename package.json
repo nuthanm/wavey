@@ -25,7 +25,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "copy:ffmpeg": "node scripts/copy-ffmpeg.mjs"
+    "copy:ffmpeg": "node scripts/copy-ffmpeg.mjs",
+    "check:yt-cookie": "node scripts/verify-yt-cookie.mjs"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.6",

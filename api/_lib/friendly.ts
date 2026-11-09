@@ -32,11 +32,13 @@ export function friendlyApiError(raw: unknown): { error: string; code: string; h
       hint: 'try a public youtube video or public reel.',
     }
   }
-  if (/age|confirm your age|sign in to confirm/.test(lower)) {
+  if (/age|confirm your age|sign in to confirm|age-restricted|login_required/.test(lower)) {
     return {
       code: 'yt_age',
       error: 'age-gated — youtube is gatekeeping this one.',
-      hint: 'public vids only, or set YT_COOKIE on the server.',
+      hint: /stale|cookie may be stale/.test(lower)
+        ? 'server YouTube session looks stale — refresh it, or switch to Upload with a file you already have.'
+        : 'Wavey can’t sign into YouTube for you. Try another public link, or use the Upload tab with a file you already have.',
     }
   }
   if (/region|country|geo/.test(lower)) {
@@ -50,7 +52,7 @@ export function friendlyApiError(raw: unknown): { error: string; code: string; h
     return {
       code: 'yt_decipher',
       error: 'couldn’t unlock the stream url.',
-      hint: 'retry, or set YT_COOKIE in .env.local.',
+      hint: 'retry once — or use Upload if you already have the file.',
     }
   }
   if (/token expired/.test(lower)) {
