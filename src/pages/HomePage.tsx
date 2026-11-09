@@ -7,7 +7,7 @@ import {
   resolveMedia,
   type ResolveResponse,
 } from '../lib/api'
-import { encodeToMp3 } from '../lib/encodeMp3'
+import { convertToMp4, encodeToMp3, muxToMp4 } from '../lib/encodeMp3'
 import {
   friendlyFromUnknown,
   toWaveyError,
@@ -19,13 +19,13 @@ import { ErrorBanner } from '../components/ErrorBanner'
 import { LinkPreview } from '../components/LinkPreview'
 import { RealisticWave } from '../components/RealisticWave'
 
-type Mode = 'youtube' | 'instagram'
+type Mode = 'youtube' | 'instagram' | 'upload'
 type OutputFormat = 'mp3' | 'mp4'
 type IgKind = 'reel' | 'story'
 
 const INSTAGRAM_ENABLED = false
 type QualityId = 'chill' | 'clean' | 'cranked' | 'studio'
-type VideoQualityId = 'hd' | 'fhd' | 'qhd' | 'uhd'
+type VideoQualityId = 'sd' | 'nhd' | 'hd' | 'fhd' | 'qhd' | 'uhd'
 
 const AUDIO_QUALITIES: Array<{
   id: QualityId
@@ -46,11 +46,16 @@ const VIDEO_QUALITIES: Array<{
   height: number
   blurb: string
 }> = [
+  { id: 'sd', name: 'SD', res: '360p', height: 360, blurb: 'tiny file, quick pull' },
+  { id: 'nhd', name: '480p', res: '480p', height: 480, blurb: 'light + watchable' },
   { id: 'hd', name: 'HD', res: '720p', height: 720, blurb: 'fast save, still sharp' },
   { id: 'fhd', name: 'Full HD', res: '1080p', height: 1080, blurb: 'default flex quality' },
   { id: 'qhd', name: 'QHD', res: '1440p', height: 1440, blurb: 'crisp on big screens' },
   { id: 'uhd', name: '4K', res: '2160p', height: 2160, blurb: 'max video fidelity' },
 ]
+
+const UPLOAD_ACCEPT =
+  'video/*,audio/*,.mp4,.webm,.mov,.mkv,.m4a,.mp3,.ogg,.wav,.aac'
 
 function formatTime(sec: number) {
   if (!Number.isFinite(sec)) return '0:00'
@@ -61,13 +66,23 @@ function formatTime(sec: number) {
 
 function fallbackMeta(_url: string, mode: Mode) {
   return {
-    title: mode === 'youtube' ? 'paste a link to preview' : 'paste a reel or story',
+    title:
+      mode === 'youtube'
+        ? 'paste a link to preview'
+        : mode === 'upload'
+          ? 'drop a local video or audio file'
+          : 'paste a reel or story',
     creator: '@wavey',
     duration: '—',
-    thumbHue: mode === 'youtube' ? 80 : 300,
+    thumbHue: mode === 'youtube' ? 80 : mode === 'upload' ? 160 : 300,
     thumbUrl: null as string | null,
-    kindLabel: mode === 'youtube' ? 'YouTube' : 'Instagram',
+    kindLabel: mode === 'youtube' ? 'YouTube' : mode === 'upload' ? 'Upload' : 'Instagram',
   }
+}
+
+function heightAvailable(available: number[] | undefined, height: number): boolean {
+  if (!available?.length) return true
+  return available.some((h) => h >= height - 16)
 }
 
 export function HomePage() {
@@ -91,6 +106,8 @@ export function HomePage() {
   const [duration, setDuration] = useState(0)
   const [toast, setToast] = useState<{ text: string; kind: 'ok' | 'err' } | null>(null)
   const [apiOnline, setApiOnline] = useState<boolean | null>(null)
+  const [uploadFile, setUploadFile] = useState<File | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const showOk = (text: string) => setToast({ text, kind: 'ok' })
   const showErr = (err: unknown) => {
@@ -134,10 +151,11 @@ export function HomePage() {
     : fallbackMeta(url, mode)
 
   const canRip =
-    url.trim().length > 8 &&
     status !== 'ripping' &&
     !resolving &&
-    (detected === mode || detected === 'unknown')
+    (mode === 'upload'
+      ? Boolean(uploadFile)
+      : url.trim().length > 8 && (detected === mode || detected === 'unknown'))
 
   // Only revoke blob URLs — never abort the active pull when mediaUrl changes
   useEffect(() => {
@@ -167,6 +185,7 @@ export function HomePage() {
 
   // Debounced resolve for live preview (paused while a pull is in flight)
   useEffect(() => {
+    if (mode === 'upload') return
     const trimmed = url.trim()
     if (
       status === 'ripping' ||
@@ -182,12 +201,11 @@ export function HomePage() {
         setResolving(true)
         setFriendlyError(null)
         try {
-          // Preview/resolve as video — MP3 is extracted client-side from that file
           const qualityValue =
-            outputFormat === 'mp3' ? 720 : selectedVideo.height
+            outputFormat === 'mp3' ? selectedAudio.kbps : selectedVideo.height
           const data = await resolveMedia({
             url: trimmed,
-            output: 'mp4',
+            output: outputFormat,
             quality: qualityValue,
             signal: controller.signal,
           })
@@ -196,6 +214,17 @@ export function HomePage() {
           setFriendlyError(null)
           if (data.platform === 'instagram') {
             setIgKind(data.isStory || /story/i.test(data.kindLabel) ? 'story' : 'reel')
+          }
+          // Auto-pick closest available height when user asked for something missing
+          if (
+            outputFormat === 'mp4' &&
+            data.availableHeights?.length &&
+            !heightAvailable(data.availableHeights, selectedVideo.height)
+          ) {
+            const best = [...VIDEO_QUALITIES]
+              .reverse()
+              .find((q) => heightAvailable(data.availableHeights, q.height))
+            if (best) setVideoQuality(best.id)
           }
         } catch (err) {
           // Chrome often reports aborted fetch as TypeError: Failed to fetch
@@ -225,9 +254,35 @@ export function HomePage() {
     setPlaying(false)
     setResolved(null)
     setFriendlyError(null)
+    setUploadFile(null)
     if (next === 'instagram') setOutputFormat('mp4')
     audioRef.current?.pause()
     videoRef.current?.pause()
+  }
+
+  const onPickUpload = (file: File | null) => {
+    if (!file) return
+    setUploadFile(file)
+    setUrl('')
+    setResolved({
+      ok: true,
+      platform: 'youtube',
+      title: file.name.replace(/\.[^.]+$/, '') || file.name,
+      creator: '@local',
+      duration: '—',
+      durationSec: 0,
+      thumbUrl: null,
+      thumbHue: 160,
+      kindLabel: 'Upload',
+      mimeType: file.type || 'application/octet-stream',
+      filename: file.name,
+      token: '',
+      needsEncode: outputFormat === 'mp3',
+      needsMux: false,
+    })
+    setFriendlyError(null)
+    setStatus('idle')
+    showOk('file locked in')
   }
 
   const pasteFromClipboard = async () => {
@@ -252,6 +307,9 @@ export function HomePage() {
 
   const ctaLabel = () => {
     if (status === 'ripping') return 'pulling…'
+    if (mode === 'upload') {
+      return outputFormat === 'mp4' ? 'CONVERT TO MP4' : 'CONVERT TO MP3'
+    }
     if (mode === 'instagram') {
       if (outputFormat === 'mp3') return 'PULL AUDIO MP3'
       return igKind === 'story' ? 'SAVE THE STORY' : 'SAVE THE REEL'
@@ -262,9 +320,165 @@ export function HomePage() {
   const activeMediaEl = () =>
     mediaKind === 'video' ? videoRef.current : audioRef.current
 
+  const ripUpload = async (file: File, pullAbort: AbortController) => {
+    setProgress(10)
+    setProgressLabel('reading local file…')
+    const inputBlob = file
+    let finalBlob: Blob
+    let kind: 'audio' | 'video'
+
+    if (outputFormat === 'mp3') {
+      setProgress(20)
+      setProgressLabel(`encoding mp3 @ ${selectedAudio.kbps}kbps…`)
+      finalBlob = await encodeToMp3(inputBlob, {
+        bitrateKbps: selectedAudio.kbps,
+        contentType: file.type,
+        filename: file.name,
+        onProgress: (pct) => setProgress(20 + Math.round(pct * 0.75)),
+      })
+      kind = 'audio'
+    } else {
+      setProgress(20)
+      setProgressLabel('converting to mp4…')
+      finalBlob = await convertToMp4(inputBlob, {
+        filename: file.name,
+        onProgress: (pct) => setProgress(20 + Math.round(pct * 0.75)),
+      })
+      kind = 'video'
+    }
+
+    if (pullAbort.signal.aborted) throw new DOMException('Aborted', 'AbortError')
+
+    setResolved({
+      ok: true,
+      platform: 'youtube',
+      title: file.name.replace(/\.[^.]+$/, '') || file.name,
+      creator: '@local',
+      duration: '—',
+      durationSec: 0,
+      thumbUrl: null,
+      thumbHue: 160,
+      kindLabel: 'Upload',
+      mimeType: finalBlob.type,
+      filename: file.name.replace(/\.[^.]+$/, outputFormat === 'mp3' ? '.mp3' : '.mp4'),
+      token: '',
+      needsEncode: false,
+      needsMux: false,
+    })
+
+    return { finalBlob, kind }
+  }
+
+  const ripRemote = async (pullAbort: AbortController) => {
+    const resolveOutput = outputFormat
+    const qualityValue =
+      outputFormat === 'mp3' ? selectedAudio.kbps : selectedVideo.height
+    const data = await resolveMedia({
+      url: url.trim(),
+      output: resolveOutput,
+      quality: qualityValue,
+      signal: pullAbort.signal,
+    })
+    setResolved(data)
+
+    setProgress(8)
+    setProgressLabel(
+      mode === 'instagram'
+        ? igKind === 'story'
+          ? 'opening story…'
+          : 'opening reel…'
+        : outputFormat === 'mp3'
+          ? 'grabbing audio stream…'
+          : data.needsMux
+            ? 'grabbing adaptive video + audio…'
+            : 'grabbing video stream…',
+    )
+
+    let finalBlob: Blob
+    let kind: 'audio' | 'video'
+    let contentType: string
+
+    if (outputFormat === 'mp4' && data.needsMux) {
+      // High-res YouTube: separate streams → remux in browser (the reliable path)
+      const [videoPart, audioPart] = await Promise.all([
+        downloadWithProgress(
+          data.token,
+          (pct) => {
+            setProgress(Math.max(8, Math.min(40, 8 + pct * 0.32)))
+            setProgressLabel('downloading video…')
+          },
+          pullAbort.signal,
+          'video',
+        ),
+        downloadWithProgress(
+          data.token,
+          (pct) => {
+            setProgress(Math.max(40, Math.min(68, 40 + pct * 0.28)))
+            setProgressLabel('downloading audio…')
+          },
+          pullAbort.signal,
+          'audio',
+        ),
+      ])
+
+      setProgress(70)
+      setProgressLabel('merging video + audio…')
+      try {
+        finalBlob = await muxToMp4(videoPart.blob, audioPart.blob, {
+          videoName: data.filename,
+          audioName: data.filename.replace(/\.mp4$/i, '.m4a'),
+          onProgress: (pct) => setProgress(70 + Math.round(pct * 0.28)),
+        })
+      } catch (muxErr) {
+        throw toWaveyError(
+          muxErr instanceof Error ? muxErr.message : 'Could not merge video + audio into MP4',
+        )
+      }
+      kind = 'video'
+      contentType = 'video/mp4'
+    } else {
+      const part = outputFormat === 'mp3' ? ('auto' as const) : ('auto' as const)
+      const downloaded = await downloadWithProgress(
+        data.token,
+        (pct) => {
+          setProgress(Math.max(8, Math.min(70, pct * 0.7)))
+          setProgressLabel('downloading…')
+        },
+        pullAbort.signal,
+        part,
+      )
+      contentType = downloaded.contentType
+
+      if (outputFormat === 'mp3') {
+        setProgress(72)
+        setProgressLabel(`encoding mp3 @ ${selectedAudio.kbps}kbps…`)
+        try {
+          finalBlob = await encodeToMp3(downloaded.blob, {
+            bitrateKbps: selectedAudio.kbps,
+            contentType,
+            filename: data.filename,
+            onProgress: (pct) => setProgress(72 + Math.round(pct * 0.26)),
+          })
+        } catch (encodeErr) {
+          throw toWaveyError(
+            encodeErr instanceof Error ? encodeErr.message : 'mp3 encode failed',
+          )
+        }
+        kind = 'audio'
+      } else if (!contentType.startsWith('video/') && contentType.startsWith('image/')) {
+        throw new WaveyError('image_not_video')
+      } else {
+        finalBlob = downloaded.blob
+        kind = contentType.startsWith('video/') ? 'video' : 'audio'
+      }
+    }
+
+    return { finalBlob, kind }
+  }
+
   const ripIt = async () => {
     if (!canRip) return
-    if (detected && detected !== 'unknown' && detected !== mode) {
+    if (mode !== 'upload' && detected && detected !== 'unknown' && detected !== mode) {
       showErr(new WaveyError('wrong_platform'))
       return
     }
@@ -281,65 +495,13 @@ export function HomePage() {
     setFriendlyError(null)
     setStatus('ripping')
     setProgress(2)
-    setProgressLabel('resolving media…')
+    setProgressLabel(mode === 'upload' ? 'preparing convert…' : 'resolving media…')
 
     try {
-      // MP3 = download MP4 (works) → encode audio in the browser
-      const resolveOutput = 'mp4' as const
-      const qualityValue =
-        outputFormat === 'mp3' ? 720 : selectedVideo.height
-      const data = await resolveMedia({
-        url: url.trim(),
-        output: resolveOutput,
-        quality: qualityValue,
-        signal: pullAbort.signal,
-      })
-      setResolved(data)
-
-      setProgress(8)
-      setProgressLabel(
-        mode === 'instagram'
-          ? igKind === 'story'
-            ? 'opening story…'
-            : 'opening reel…'
-          : outputFormat === 'mp3'
-            ? 'grabbing video for mp3…'
-            : 'grabbing video stream…',
-      )
-
-      const { blob, contentType } = await downloadWithProgress(
-        data.token,
-        (pct) => {
-          setProgress(Math.max(8, Math.min(70, pct * 0.7)))
-          setProgressLabel('downloading…')
-        },
-        pullAbort.signal,
-      )
-
-      let finalBlob = blob
-      let kind: 'audio' | 'video' = 'video'
-
-      if (outputFormat === 'mp3') {
-        setProgress(72)
-        setProgressLabel(`mp4 → mp3 @ ${selectedAudio.kbps}kbps…`)
-        try {
-          finalBlob = await encodeToMp3(blob, {
-            bitrateKbps: selectedAudio.kbps,
-            contentType,
-            filename: data.filename,
-            onProgress: (pct) => {
-              setProgress(72 + Math.round(pct * 0.26))
-            },
-          })
-        } catch (encodeErr) {
-          throw toWaveyError(encodeErr instanceof Error ? encodeErr.message : 'mp3 encode failed')
-        }
-        kind = 'audio'
-      } else if (!contentType.startsWith('video/') && contentType.startsWith('image/')) {
-        throw new WaveyError('image_not_video')
-      } else {
-        kind = contentType.startsWith('video/') ? 'video' : 'audio'
-      }
+      const { finalBlob, kind } =
+        mode === 'upload' && uploadFile
+          ? await ripUpload(uploadFile, pullAbort)
+          : await ripRemote(pullAbort)
 
       const objectUrl = URL.createObjectURL(finalBlob)
       setMediaUrl(objectUrl)
@@ -353,9 +515,13 @@ export function HomePage() {
           ? igKind === 'story'
             ? 'story ready'
             : 'reel ready'
-          : outputFormat === 'mp4'
-            ? 'mp4 ready'
-            : 'mp3 ready',
+          : mode === 'upload'
+            ? outputFormat === 'mp4'
+              ? 'mp4 ready'
+              : 'mp3 ready'
+            : outputFormat === 'mp4'
+              ? 'mp4 ready'
+              : 'mp3 ready',
       )
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -392,7 +558,9 @@ export function HomePage() {
         ? outputFormat === 'mp4'
           ? `wavey-${selectedVideo.res}.${ext}`
           : `wavey-${quality}-${selectedAudio.kbps}kbps.${ext}`
-        : `wavey-${igKind}.${ext}`)
+        : mode === 'upload'
+          ? `wavey-upload.${ext}`
+          : `wavey-${igKind}.${ext}`)
     a.click()
     showOk(`${ext} download started`)
   }
@@ -484,10 +652,10 @@ export function HomePage() {
                 <span>catch the vibe.</span>
               </h1>
               <p className="rw-hero-lead">
-                Convert <strong>YouTube</strong> to clean <strong>MP3</strong> or
-                high-quality <strong>MP4</strong>, and save{' '}
-                Instagram reels soon. Built for phone,
-                desktop, and webview — no sketchy redirects.
+                Convert <strong>YouTube</strong> or a <strong>local file</strong> to
+                clean <strong>MP3</strong> or high-quality <strong>MP4</strong> at
+                any resolution you pick. Built for phone, desktop, and webview —
+                no sketchy redirects.
               </p>
               <div className="rw-trust-row" aria-label="Trust signals">
                 <span className="rw-trust-chip">No account needed</span>
@@ -525,6 +693,14 @@ export function HomePage() {
                 YouTube
               </button>
               <button
+                className="rw-mode"
+                role="tab"
+                aria-pressed={mode === 'upload'}
+                onClick={() => switchMode('upload')}
+              >
+                Upload
+              </button>
+              <button
                 className={`rw-mode${!INSTAGRAM_ENABLED ? ' is-soon' : ''}`}
                 role="tab"
                 aria-pressed={mode === 'instagram'}
@@ -543,56 +719,105 @@ export function HomePage() {
             </div>
 
             <div style={{ marginTop: 16 }}>
-              <label className="rw-label" htmlFor="rip-url">
-                paste link
-              </label>
-              <div className="rw-input-wrap">
-                <input
-                  id="rip-url"
-                  className="rw-input"
-                  value={url}
-                  onChange={(e) => {
-                    const next = e.target.value
-                    setUrl(next)
-                    setStatus('idle')
-                    setResolved(null)
-                    setFriendlyError(null)
-                    if (INSTAGRAM_ENABLED && /instagram\.com\/stories?\//i.test(next)) {
-                      setMode('instagram')
-                      setIgKind('story')
-                      setOutputFormat('mp4')
-                    } else if (
-                      INSTAGRAM_ENABLED &&
-                      /instagram\.com\/(reel|reels)\//i.test(next)
-                    ) {
-                      setMode('instagram')
-                      setIgKind('reel')
-                      setOutputFormat('mp4')
-                    }
-                  }}
-                  placeholder={
-                    mode === 'youtube'
-                      ? 'https://youtube.com/watch?v=…'
-                      : igKind === 'story'
-                        ? 'https://instagram.com/stories/…'
-                        : 'https://instagram.com/reel/…'
-                  }
-                  inputMode="url"
-                  autoCapitalize="off"
-                  autoCorrect="off"
-                  spellCheck={false}
-                />
-                <button
-                  type="button"
-                  className="rw-paste"
-                  onClick={pasteFromClipboard}
-                  aria-label="Paste from clipboard"
-                  title="Paste"
-                >
-                  ⎘
-                </button>
-              </div>
-              {detectingHint(detected, mode, resolving, Boolean(friendlyError))}
+              {mode === 'upload' ? (
+                <>
+                  <label className="rw-label" htmlFor="rip-upload">
+                    upload video or audio
+                  </label>
+                  <input
+                    ref={fileInputRef}
+                    id="rip-upload"
+                    className="rw-file-input"
+                    type="file"
+                    accept={UPLOAD_ACCEPT}
+                    onChange={(e) => onPickUpload(e.target.files?.[0] || null)}
+                  />
+                  <button
+                    type="button"
+                    className={`rw-dropzone${uploadFile ? ' has-file' : ''}`}
+                    onClick={() => fileInputRef.current?.click()}
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      e.dataTransfer.dropEffect = 'copy'
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      const file = e.dataTransfer.files?.[0]
+                      if (file) onPickUpload(file)
+                    }}
+                  >
+                    {uploadFile ? (
+                      <>
+                        <strong>{uploadFile.name}</strong>
+                        <span>
+                          {(uploadFile.size / (1024 * 1024)).toFixed(1)} MB · tap to swap
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <strong>Drop a file here</strong>
+                        <span>or tap to browse · mp4, webm, mov, mkv, mp3, m4a…</span>
+                      </>
+                    )}
+                  </button>
+                  <p className="rw-hint ok">
+                    converts entirely in your browser — nothing uploaded to a server
+                  </p>
+                </>
+              ) : (
+                <>
+                  <label className="rw-label" htmlFor="rip-url">
+                    paste link
+                  </label>
+                  <div className="rw-input-wrap">
+                    <input
+                      id="rip-url"
+                      className="rw-input"
+                      value={url}
+                      onChange={(e) => {
+                        const next = e.target.value
+                        setUrl(next)
+                        setStatus('idle')
+                        setResolved(null)
+                        setFriendlyError(null)
+                        if (INSTAGRAM_ENABLED && /instagram\.com\/stories?\//i.test(next)) {
+                          setMode('instagram')
+                          setIgKind('story')
+                          setOutputFormat('mp4')
+                        } else if (
+                          INSTAGRAM_ENABLED &&
+                          /instagram\.com\/(reel|reels)\//i.test(next)
+                        ) {
+                          setMode('instagram')
+                          setIgKind('reel')
+                          setOutputFormat('mp4')
+                        }
+                      }}
+                      placeholder={
+                        mode === 'youtube'
+                          ? 'https://youtube.com/watch?v=…'
+                          : igKind === 'story'
+                            ? 'https://instagram.com/stories/…'
+                            : 'https://instagram.com/reel/…'
+                      }
+                      inputMode="url"
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                    />
+                    <button
+                      type="button"
+                      className="rw-paste"
+                      onClick={pasteFromClipboard}
+                      aria-label="Paste from clipboard"
+                      title="Paste"
+                    >
+                      ⎘
+                    </button>
+                  </div>
+                  {detectingHint(detected, mode, resolving, Boolean(friendlyError))}
+                </>
+              )}
 
               <AnimatePresence>
                 {friendlyError && (
@@ -604,10 +829,15 @@ export function HomePage() {
               </AnimatePresence>
 
               <AnimatePresence>
-                {url.trim().length > 8 && !friendlyError && (
+                {mode !== 'upload' && url.trim().length > 8 && !friendlyError && (
                   <LinkPreview
                     data={{
-                      platform: detected === 'unknown' || !detected ? mode : detected,
+                      platform:
+                        detected === 'unknown' || !detected
+                          ? mode === 'instagram'
+                            ? 'instagram'
+                            : 'youtube'
+                          : detected,
                       title: resolving ? 'resolving…' : meta.title,
                       creator: meta.creator,
                       duration: meta.duration,
@@ -622,9 +852,9 @@ export function HomePage() {
             </div>
 
             <AnimatePresence mode="wait">
-              {mode === 'youtube' ? (
+              {mode === 'youtube' || mode === 'upload' ? (
                 <motion.div
-                  key="yt"
+                  key={mode === 'upload' ? 'up' : 'yt'}
                   initial={{ opacity: 0, y: 8 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -8 }}
@@ -652,41 +882,82 @@ export function HomePage() {
                     </button>
                   </div>
 
-                  <h2 className="rw-section-title">
-                    {outputFormat === 'mp4' ? 'pick the resolution' : 'pick the loudness'}
-                  </h2>
-                  {outputFormat === 'mp3' ? (
-                    <div className="rw-qualities" role="group" aria-label="Bitrate">
-                      {AUDIO_QUALITIES.map((q) => (
-                        <button
-                          key={q.id}
-                          type="button"
-                          className="rw-quality"
-                          aria-pressed={quality === q.id}
-                          onClick={() => setQuality(q.id)}
-                        >
-                          <strong>{q.name}</strong>
-                          <em>{q.kbps} kbps</em>
-                          <span>{q.blurb}</span>
-                        </button>
-                      ))}
-                    </div>
+                  {mode === 'upload' ? (
+                    <p className="rw-hint" style={{ marginTop: 12 }}>
+                      {outputFormat === 'mp3'
+                        ? 'Pulls the audio track from your file and encodes MP3 locally.'
+                        : 'Keeps MP4 as-is when possible, or remuxes/transcodes other video containers.'}
+                    </p>
                   ) : (
-                    <div className="rw-qualities" role="group" aria-label="Resolution">
-                      {VIDEO_QUALITIES.map((q) => (
-                        <button
-                          key={q.id}
-                          type="button"
-                          className="rw-quality"
-                          aria-pressed={videoQuality === q.id}
-                          onClick={() => setVideoQuality(q.id)}
-                        >
-                          <strong>{q.name}</strong>
-                          <em>{q.res}</em>
-                          <span>{q.blurb}</span>
-                        </button>
-                      ))}
-                    </div>
+                    <>
+                      <h2 className="rw-section-title">
+                        {outputFormat === 'mp4'
+                          ? 'pick the resolution'
+                          : 'pick the loudness'}
+                      </h2>
+                      {outputFormat === 'mp3' ? (
+                        <div className="rw-qualities" role="group" aria-label="Bitrate">
+                          {AUDIO_QUALITIES.map((q) => (
+                            <button
+                              key={q.id}
+                              type="button"
+                              className="rw-quality"
+                              aria-pressed={quality === q.id}
+                              onClick={() => setQuality(q.id)}
+                            >
+                              <strong>{q.name}</strong>
+                              <em>{q.kbps} kbps</em>
+                              <span>{q.blurb}</span>
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <>
+                          <div
+                            className="rw-qualities"
+                            role="group"
+                            aria-label="Resolution"
+                          >
+                            {VIDEO_QUALITIES.map((q) => {
+                              const available = heightAvailable(
+                                resolved?.availableHeights,
+                                q.height,
+                              )
+                              return (
+                                <button
+                                  key={q.id}
+                                  type="button"
+                                  className={`rw-quality${!available ? ' is-dim' : ''}`}
+                                  aria-pressed={videoQuality === q.id}
+                                  title={
+                                    available
+                                      ? q.blurb
+                                      : 'not listed for this video — we’ll fall back to the next best'
+                                  }
+                                  onClick={() => setVideoQuality(q.id)}
+                                >
+                                  <strong>{q.name}</strong>
+                                  <em>{q.res}</em>
+                                  <span>
+                                    {available
+                                      ? q.height > 720
+                                        ? 'adaptive merge'
+                                        : q.blurb
+                                      : 'fallback if missing'}
+                                  </span>
+                                </button>
+                              )
+                            })}
+                          </div>
+                          {resolved?.needsMux && (
+                            <p className="rw-hint ok">
+                              1080p+ downloads as separate video + audio, then merges in
+                              your browser so the file has sound.
+                            </p>
+                          )}
+                        </>
+                      )}
+                    </>
                   )}
                 </motion.div>
               ) : (
@@ -817,7 +1088,11 @@ export function HomePage() {
                         outputFormat === 'mp4' ? (
                           <>
                             <span className="rw-tag">{selectedVideo.name}</span>
-                            <span className="rw-tag">{selectedVideo.res}</span>
+                            <span className="rw-tag">
+                              {resolved?.actualQuality
+                                ? `${resolved.actualQuality}p`
+                                : selectedVideo.res}
+                            </span>
                           </>
                         ) : (
                           <>
@@ -825,6 +1100,8 @@ export function HomePage() {
                             <span className="rw-tag">{selectedAudio.kbps} kbps</span>
                           </>
                         )
+                      ) : mode === 'upload' ? (
+                        <span className="rw-tag">local file</span>
                       ) : (
                         <>
                           <span className="rw-tag">{igKind}</span>
@@ -926,12 +1203,16 @@ export function HomePage() {
                   onClick={() => {
                     setStatus('idle')
                     setUrl('')
+                    setUploadFile(null)
                     setPlaying(false)
                     setResolved(null)
                     setFriendlyError(null)
+                    setReadyBlob(null)
+                    if (mediaUrl) URL.revokeObjectURL(mediaUrl)
+                    setMediaUrl(null)
                   }}
                 >
-                  PULL ANOTHER
+                  {mode === 'upload' ? 'CONVERT ANOTHER' : 'PULL ANOTHER'}
                 </button>
               </motion.div>
             )}
@@ -940,8 +1221,8 @@ export function HomePage() {
           <p className="rw-footer-note">
             For personal, lawful use only — save media you own or have permission
             to keep. Not affiliated with YouTube, Google, Instagram, or Meta.
-            Platform terms still apply. Stories need a server session cookie;
-            public reels and YouTube links work without one.
+            Platform terms still apply. Local uploads convert in your browser;
+            YouTube 1080p+ is merged client-side so audio stays in the file.
           </p>
         </section>
       </div>
@@ -968,7 +1249,7 @@ function detectingHint(
   resolving: boolean,
   hasError: boolean,
 ) {
-  if (hasError) return null
+  if (hasError || mode === 'upload') return null
   if (resolving) return <p className="rw-hint ok">locking the vibe…</p>
   if (detected && detected !== 'unknown' && detected !== mode) {
     return (
@@ -983,7 +1264,7 @@ function detectingHint(
   return (
     <p className="rw-hint">
       {mode === 'youtube'
-        ? 'works with youtube + youtube music links'
+        ? 'works with youtube + youtube music links · any resolution'
         : 'paste a public reel — stories need IG_SESSIONID on the server'}
     </p>
   )

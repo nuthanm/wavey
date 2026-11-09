@@ -7,9 +7,14 @@ export type StreamTokenPayload = {
   /** bitrate kbps for audio, or height like 720/1080 for video */
   quality: number
   mediaUrl?: string
+  /** Second leg for adaptive YouTube (audio). Prefer re-fetch via part= when absent. */
+  audioUrl?: string
   mimeType?: string
+  audioMimeType?: string
   filename: string
   title: string
+  /** Client must download video+audio parts and remux with ffmpeg.wasm */
+  needsMux?: boolean
   exp: number
 }
 

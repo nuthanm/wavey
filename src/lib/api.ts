@@ -15,6 +15,10 @@ export type ResolveResponse = {
   filename: string
   token: string
   needsEncode?: boolean
+  /** High-res YouTube: download video+audio parts and remux in the browser */
+  needsMux?: boolean
+  actualQuality?: number
+  availableHeights?: number[]
   isStory?: boolean
   note?: string
 }
@@ -194,16 +198,19 @@ export async function resolveMedia(input: {
   return data
 }
 
-export function streamUrl(token: string): string {
-  return apiUrl(`/api/stream?token=${encodeURIComponent(token)}`)
+export function streamUrl(token: string, part?: 'video' | 'audio' | 'auto'): string {
+  const base = apiUrl(`/api/stream?token=${encodeURIComponent(token)}`)
+  if (!part || part === 'auto') return base
+  return `${base}&part=${part}`
 }
 
 export async function downloadWithProgress(
   token: string,
   onProgress: (pct: number) => void,
   signal?: AbortSignal,
+  part?: 'video' | 'audio' | 'auto',
 ): Promise<{ blob: Blob; contentType: string }> {
-  const url = streamUrl(token)
+  const url = streamUrl(token, part)
   onProgress(5)
 
   // XHR first — survives Vite HMR noise better than fetch+arrayBuffer for big bodies

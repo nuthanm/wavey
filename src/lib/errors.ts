@@ -22,6 +22,8 @@ export type WaveyErrorCode =
   | 'token_invalid'
   | 'download_fail'
   | 'encode_fail'
+  | 'mux_fail'
+  | 'upload_fail'
   | 'image_not_video'
   | 'clipboard'
   | 'share_cancel'
@@ -140,6 +142,16 @@ const COPY: Record<WaveyErrorCode, Omit<FriendlyError, 'code'>> = {
     title: 'mp3 encode fumbled',
     message: 'browser ffmpeg couldn’t finish the convert.',
     hint: 'retry, or pick chill/clean bitrate. hard-refresh if wasm got stuck.',
+  },
+  mux_fail: {
+    title: 'video merge flopped',
+    message: 'couldn’t join the separate video + audio streams.',
+    hint: 'retry once, or pick 720p (single-file) if 1080p/4K keeps failing.',
+  },
+  upload_fail: {
+    title: 'upload convert flopped',
+    message: 'couldn’t convert that local file in the browser.',
+    hint: 'try a smaller clip, or another container (mp4 / webm / mov).',
   },
   image_not_video: {
     title: 'that’s a photo',
@@ -310,7 +322,13 @@ export function toWaveyError(input: unknown, status?: number): WaveyError {
   if (includesAny(msg, ['image, not a video', 'photo'])) {
     return new WaveyError('image_not_video', st)
   }
-  if (includesAny(msg, ['encode', 'ffmpeg', 'mp3 encode'])) {
+  if (includesAny(msg, ['merge video', 'mux', 'remux'])) {
+    return new WaveyError('mux_fail', st)
+  }
+  if (includesAny(msg, ['upload', 'local file', 'mp4 convert failed'])) {
+    return new WaveyError('upload_fail', st)
+  }
+  if (includesAny(msg, ['encode', 'ffmpeg', 'mp3 encode', 'no audio track'])) {
     return new WaveyError('encode_fail', st)
   }
   if (includesAny(msg, ['download', 'upstream', 'stream failed'])) {

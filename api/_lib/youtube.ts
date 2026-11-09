@@ -23,6 +23,34 @@ export type PickedFormat = {
   contentLength?: number
 }
 
+export type YoutubeDelivery =
+  | {
+      mode: 'single'
+      kind: 'audio' | 'video'
+      mediaUrl: string
+      mimeType: string
+      filename: string
+      quality: number
+      title: string
+      needsMux: false
+      availableHeights: number[]
+    }
+  | {
+      mode: 'adaptive'
+      kind: 'video'
+      videoUrl: string
+      audioUrl: string
+      videoMime: string
+      audioMime: string
+      filename: string
+      quality: number
+      title: string
+      needsMux: true
+      availableHeights: number[]
+    }
+
+type YtInfo = Awaited<ReturnType<typeof getInfo>>
+
 let innertubePromise: Promise<Innertube> | null = null
 
 function resetTube() {
@@ -105,31 +133,36 @@ export async function resolveYoutube(sourceUrl: string): Promise<ResolvedMedia> 
   }
 }
 
-function videoQualityLabel(height: number): string {
-  if (height >= 2160) return '2160p'
-  if (height >= 1440) return '1440p'
-  if (height >= 1080) return '1080p'
-  if (height >= 720) return '720p'
-  return '480p'
-}
-
 export function youtubeOutputHints(
   meta: ResolvedMedia,
   opts: { kind: 'audio' | 'video'; quality: number },
-): { mimeType: string; filename: string; needsEncode: boolean } {
+): { mimeType: string; filename: string; needsEncode: boolean; needsMux: boolean } {
   const base = sanitizeFilename(meta.title)
   if (opts.kind === 'audio') {
     return {
       mimeType: 'audio/mp4',
       filename: `${base}.m4a`,
       needsEncode: true,
+      needsMux: false,
     }
   }
   return {
     mimeType: 'video/mp4',
     filename: `${base}.mp4`,
     needsEncode: false,
+    // High-res YouTube is almost always adaptive (separate A/V)
+    needsMux: opts.quality > 720,
   }
+}
+
+function videoQualityLabel(height: number): string {
+  if (height >= 2160) return '2160p'
+  if (height >= 1440) return '1440p'
+  if (height >= 1080) return '1080p'
+  if (height >= 720) return '720p'
+  if (height >= 480) return '480p'
+  if (height >= 360) return '360p'
+  return '240p'
 }
 
 function videoQualityFallbacks(height: number): string[] {
@@ -140,57 +173,25 @@ function videoQualityFallbacks(height: number): string[] {
   return [...fromRequested, 'best', 'bestefficiency']
 }
 
-function chooseBestFormat(
-  info: Awaited<ReturnType<typeof getInfo>>,
-  opts: { kind: 'audio' | 'video'; quality: number },
-) {
-  if (opts.kind === 'audio') {
-    return info.chooseFormat({ type: 'audio', quality: 'best', format: 'any' })
+export function listAvailableHeights(info: YtInfo): number[] {
+  const heights = new Set<number>()
+  const formats = [
+    ...(info.streaming_data?.formats || []),
+    ...(info.streaming_data?.adaptive_formats || []),
+  ]
+  for (const f of formats) {
+    const h = typeof f.height === 'number' ? f.height : 0
+    if (h > 0) heights.add(h)
   }
-
-  let lastErr: unknown
-  for (const quality of videoQualityFallbacks(opts.quality)) {
-    try {
-      const format = info.chooseFormat({
-        type: 'video+audio',
-        quality,
-        format: 'any',
-      })
-      const mime = (format.mime_type || '').toLowerCase()
-      if (mime.startsWith('audio/')) {
-        lastErr = new Error('audio-only format')
-        continue
-      }
-      return format
-    } catch (err) {
-      lastErr = err
-    }
-  }
-
-  // Last ditch: any video (may be video-only)
-  try {
-    return info.chooseFormat({ type: 'video', quality: 'best', format: 'any' })
-  } catch (err) {
-    throw lastErr instanceof Error ? lastErr : err
-  }
+  return [...heights].sort((a, b) => b - a)
 }
 
-export async function pickYoutubeFormat(
-  sourceUrl: string,
-  opts: { kind: 'audio' | 'video'; quality: number },
-): Promise<PickedFormat & { title: string }> {
-  const meta = await resolveYoutube(sourceUrl)
-  const info = await getInfo(meta.videoId)
-  const format = chooseBestFormat(info, opts)
-
-  const mime = (format.mime_type || '').split(';')[0]!.trim().toLowerCase()
-  if (opts.kind === 'video' && mime.startsWith('audio/')) {
-    throw new Error('No progressive video URL — use Innertube download')
-  }
-  if (opts.kind === 'audio' && mime.startsWith('video/')) {
-    throw new Error('Got video container for audio request')
-  }
-
+async function decipherUrl(
+  // youtubei.js Format.decipher player typing changes across versions
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  format: { url?: string | null; decipher: (player?: any) => Promise<string> },
+  info: YtInfo,
+): Promise<string> {
   let mediaUrl = format.url || ''
   if (!mediaUrl) {
     try {
@@ -202,33 +203,200 @@ export async function pickYoutubeFormat(
   if (!mediaUrl) {
     throw new Error('No valid URL to decipher — try again or set YT_COOKIE')
   }
+  return mediaUrl
+}
 
-  const ext =
-    opts.kind === 'audio'
-      ? /webm|opus/i.test(mime)
-        ? 'webm'
-        : 'm4a'
-      : 'mp4'
+function mimeOf(format: { mime_type?: string }): string {
+  return (format.mime_type || '').split(';')[0]!.trim().toLowerCase()
+}
+
+function chooseAudioFormat(info: YtInfo) {
+  const attempts: Array<{ format: string; quality: string }> = [
+    { format: 'mp4', quality: 'best' },
+    { format: 'any', quality: 'best' },
+    { format: 'any', quality: 'bestefficiency' },
+  ]
+  let lastErr: unknown
+  for (const opts of attempts) {
+    try {
+      const format = info.chooseFormat({
+        type: 'audio',
+        quality: opts.quality,
+        format: opts.format,
+      })
+      const mime = mimeOf(format)
+      if (mime.startsWith('video/')) {
+        lastErr = new Error('Got video container for audio request')
+        continue
+      }
+      return format
+    } catch (err) {
+      lastErr = err
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('No audio formats available')
+}
+
+function chooseProgressiveFormat(info: YtInfo, height: number) {
+  let lastErr: unknown
+  for (const quality of videoQualityFallbacks(Math.min(height, 720))) {
+    try {
+      const format = info.chooseFormat({
+        type: 'video+audio',
+        quality,
+        format: 'any',
+      })
+      const mime = mimeOf(format)
+      if (mime.startsWith('audio/')) {
+        lastErr = new Error('audio-only format')
+        continue
+      }
+      // Prefer streams that actually include audio when the flag is present
+      if ('has_audio' in format && (format as { has_audio?: boolean }).has_audio === false) {
+        lastErr = new Error('progressive without audio')
+        continue
+      }
+      return format
+    } catch (err) {
+      lastErr = err
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('No progressive video+audio format')
+}
+
+function chooseAdaptiveVideoFormat(info: YtInfo, height: number) {
+  const containers = ['mp4', 'any'] as const
+  let lastErr: unknown
+  for (const quality of videoQualityFallbacks(height)) {
+    for (const container of containers) {
+      try {
+        const format = info.chooseFormat({
+          type: 'video',
+          quality,
+          format: container,
+        })
+        const mime = mimeOf(format)
+        if (mime.startsWith('audio/')) continue
+        return format
+      } catch (err) {
+        lastErr = err
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('No adaptive video formats')
+}
+
+export async function pickYoutubeFormat(
+  sourceUrl: string,
+  opts: { kind: 'audio' | 'video'; quality: number },
+): Promise<PickedFormat & { title: string }> {
+  const delivery = await pickYoutubeDelivery(sourceUrl, opts)
+  if (delivery.mode === 'adaptive') {
+    // Caller asked for a single URL — return the video leg (mux happens client-side)
+    return {
+      mediaUrl: delivery.videoUrl,
+      mimeType: delivery.videoMime,
+      kind: 'video',
+      quality: delivery.quality,
+      filename: delivery.filename,
+      title: delivery.title,
+    }
+  }
+  return {
+    mediaUrl: delivery.mediaUrl,
+    mimeType: delivery.mimeType,
+    kind: delivery.kind,
+    quality: delivery.quality,
+    filename: delivery.filename,
+    title: delivery.title,
+  }
+}
+
+export async function pickYoutubeDelivery(
+  sourceUrl: string,
+  opts: { kind: 'audio' | 'video'; quality: number },
+): Promise<YoutubeDelivery> {
+  const meta = await resolveYoutube(sourceUrl)
+  const info = await getInfo(meta.videoId)
+  const availableHeights = listAvailableHeights(info)
   const base = sanitizeFilename(meta.title)
 
+  if (opts.kind === 'audio') {
+    const format = chooseAudioFormat(info)
+    const mediaUrl = await decipherUrl(format, info)
+    const mime = mimeOf(format) || 'audio/mp4'
+    const ext = /webm|opus/i.test(mime) ? 'webm' : 'm4a'
+    return {
+      mode: 'single',
+      kind: 'audio',
+      mediaUrl,
+      mimeType: mime,
+      filename: `${base}.${ext}`,
+      quality: opts.quality,
+      title: meta.title,
+      needsMux: false,
+      availableHeights,
+    }
+  }
+
+  // ≤720p: prefer progressive muxed file (no browser remux)
+  if (opts.quality <= 720) {
+    try {
+      const format = chooseProgressiveFormat(info, opts.quality)
+      const mediaUrl = await decipherUrl(format, info)
+      const mime = mimeOf(format) || 'video/mp4'
+      return {
+        mode: 'single',
+        kind: 'video',
+        mediaUrl,
+        mimeType: mime,
+        filename: `${base}.mp4`,
+        quality: format.height || opts.quality,
+        title: meta.title,
+        needsMux: false,
+        availableHeights,
+      }
+    } catch {
+      // fall through to adaptive
+    }
+  }
+
+  // High-res (or progressive unavailable): separate video + audio for client remux
+  const videoFormat = chooseAdaptiveVideoFormat(info, opts.quality)
+  const audioFormat = chooseAudioFormat(info)
+  const [videoUrl, audioUrl] = await Promise.all([
+    decipherUrl(videoFormat, info),
+    decipherUrl(audioFormat, info),
+  ])
+
   return {
-    mediaUrl,
-    mimeType: mime || (opts.kind === 'audio' ? 'audio/mp4' : 'video/mp4'),
-    kind: opts.kind,
-    quality: opts.kind === 'audio' ? opts.quality : format.height || opts.quality,
-    filename: `${base}.${ext}`,
-    contentLength: format.content_length,
+    mode: 'adaptive',
+    kind: 'video',
+    videoUrl,
+    audioUrl,
+    videoMime: mimeOf(videoFormat) || 'video/mp4',
+    audioMime: mimeOf(audioFormat) || 'audio/mp4',
+    filename: `${base}.mp4`,
+    quality: videoFormat.height || opts.quality,
     title: meta.title,
+    needsMux: true,
+    availableHeights,
   }
 }
 
 export async function downloadYoutubeStream(
   sourceUrl: string,
-  opts: { kind: 'audio' | 'video'; quality: number },
+  opts: {
+    kind: 'audio' | 'video'
+    quality: number
+    /** For adaptive mux: which leg to fetch when token has no direct URL */
+    part?: 'video' | 'audio' | 'auto'
+  },
 ): Promise<{ stream: ReadableStream<Uint8Array>; mimeType: string; filename: string; title: string }> {
   const meta = await resolveYoutube(sourceUrl)
   const tube = await getTube()
   const hints = youtubeOutputHints(meta, opts)
+  const part = opts.part || 'auto'
   const ytHeaders = {
     'User-Agent':
       'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
@@ -237,37 +405,65 @@ export async function downloadYoutubeStream(
 
   // Prefer direct CDN URL first — more stable through Vite middleware than tube.download()
   try {
-    const picked = await pickYoutubeFormat(sourceUrl, opts)
-    const res = await fetch(picked.mediaUrl, { headers: ytHeaders })
-    if (res.ok && res.body) {
-      return {
-        stream: res.body,
-        mimeType: picked.mimeType,
-        filename: picked.filename,
-        title: picked.title,
+    const delivery = await pickYoutubeDelivery(sourceUrl, opts)
+    if (delivery.mode === 'adaptive') {
+      const wantAudio = part === 'audio' || (part === 'auto' && opts.kind === 'audio')
+      const mediaUrl = wantAudio ? delivery.audioUrl : delivery.videoUrl
+      const mimeType = wantAudio ? delivery.audioMime : delivery.videoMime
+      const filename = wantAudio
+        ? delivery.filename.replace(/\.mp4$/i, '.m4a')
+        : delivery.filename
+      const res = await fetch(mediaUrl, { headers: ytHeaders })
+      if (res.ok && res.body) {
+        return { stream: res.body, mimeType, filename, title: delivery.title }
+      }
+    } else {
+      const res = await fetch(delivery.mediaUrl, { headers: ytHeaders })
+      if (res.ok && res.body) {
+        return {
+          stream: res.body,
+          mimeType: delivery.mimeType,
+          filename: delivery.filename,
+          title: delivery.title,
+        }
       }
     }
   } catch {
     // fall through to Innertube download
   }
 
+  const downloadKind =
+    part === 'audio' || opts.kind === 'audio'
+      ? 'audio'
+      : part === 'video'
+        ? 'video'
+        : opts.quality > 720
+          ? 'video'
+          : 'video+audio'
+
   const qualities =
-    opts.kind === 'audio' ? ['best'] : videoQualityFallbacks(opts.quality)
+    downloadKind === 'audio' ? ['best'] : videoQualityFallbacks(opts.quality)
 
   let lastErr: unknown
   for (const client of CLIENTS) {
     for (const quality of qualities) {
       try {
         const stream = await tube.download(meta.videoId, {
-          type: opts.kind === 'audio' ? 'audio' : 'video+audio',
+          type: downloadKind,
           quality,
           format: 'any',
           client,
         })
         return {
           stream,
-          mimeType: hints.mimeType,
-          filename: hints.filename,
+          mimeType:
+            downloadKind === 'audio'
+              ? 'audio/mp4'
+              : hints.mimeType,
+          filename:
+            downloadKind === 'audio'
+              ? hints.filename
+              : hints.filename,
           title: meta.title,
         }
       } catch (err) {

@@ -33,6 +33,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return
     }
 
+    const partRaw = typeof req.query.part === 'string' ? req.query.part.toLowerCase() : 'auto'
+    const part: 'video' | 'audio' | 'auto' =
+      partRaw === 'audio' || partRaw === 'video' ? partRaw : 'auto'
+
     const payload = verifyToken(tokenParam)
     setCors(res)
 
@@ -47,13 +51,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let filename = payload.filename
     let mediaErr: unknown
 
-    if (payload.mediaUrl) {
+    const wantAudio =
+      part === 'audio' || (part === 'auto' && payload.kind === 'audio' && !payload.needsMux)
+
+    if (payload.platform === 'youtube' && payload.needsMux && part === 'auto') {
+      // Adaptive downloads must ask for an explicit part — avoid silent video-only files
+      sendError(res, 400, 'Adaptive stream needs part=video or part=audio')
+      return
+    }
+
+    const directUrl = wantAudio ? payload.audioUrl || payload.mediaUrl : payload.mediaUrl
+    if (directUrl && !(payload.needsMux && part === 'auto')) {
       try {
-        const mediaUrl = assertAllowedMediaUrl(payload.mediaUrl)
+        const mediaUrl = assertAllowedMediaUrl(directUrl)
         const headers = payload.platform === 'instagram' ? igFetchHeaders() : ytHeaders
         const fetched = await fetchToBuffer(mediaUrl.toString(), headers)
         buffer = fetched.buffer
-        contentType = payload.mimeType || fetched.contentType
+        contentType =
+          (wantAudio ? payload.audioMimeType : payload.mimeType) || fetched.contentType
+        if (wantAudio && payload.needsMux) {
+          filename = payload.filename.replace(/\.mp4$/i, '.m4a')
+        }
       } catch (err) {
         mediaErr = err
         if (payload.platform !== 'youtube') throw err
@@ -62,8 +80,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!buffer && payload.platform === 'youtube') {
       const dl = await downloadYoutubeStream(payload.sourceUrl, {
-        kind: payload.kind,
+        kind: wantAudio ? 'audio' : payload.kind,
         quality: payload.quality,
+        part: payload.needsMux ? (wantAudio ? 'audio' : 'video') : part,
       })
       buffer = await streamToBuffer(dl.stream)
       contentType = dl.mimeType

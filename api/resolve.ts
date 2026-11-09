@@ -5,7 +5,7 @@ import { resolveInstagram } from './_lib/instagram.js'
 import { clientIp, rateLimit } from './_lib/rateLimit.js'
 import { signToken } from './_lib/token.js'
 import { detectPlatform, normalizeUrl } from './_lib/validate.js'
-import { pickYoutubeFormat, resolveYoutube, youtubeOutputHints } from './_lib/youtube.js'
+import { pickYoutubeDelivery, resolveYoutube, youtubeOutputHints } from './_lib/youtube.js'
 
 export const config = {
   maxDuration: 60,
@@ -59,25 +59,46 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const meta = await resolveYoutube(url.toString())
       const hints = youtubeOutputHints(meta, { kind, quality })
       let mediaUrl: string | undefined
+      let audioUrl: string | undefined
       let mimeType = hints.mimeType
+      let audioMimeType: string | undefined
       let filename = hints.filename
+      let needsMux = false
+      let actualQuality = quality
+      let availableHeights: number[] = []
+
       try {
-        const picked = await pickYoutubeFormat(url.toString(), { kind, quality })
-        mediaUrl = picked.mediaUrl
-        mimeType = picked.mimeType
-        filename = picked.filename
+        const delivery = await pickYoutubeDelivery(url.toString(), { kind, quality })
+        availableHeights = delivery.availableHeights
+        actualQuality = delivery.quality
+        filename = delivery.filename
+        if (delivery.mode === 'adaptive') {
+          // Don't embed long CDN URLs in the token (URL length limits). Stream re-picks.
+          mimeType = delivery.videoMime
+          audioMimeType = delivery.audioMime
+          needsMux = true
+        } else {
+          mediaUrl = delivery.mediaUrl
+          mimeType = delivery.mimeType
+          needsMux = false
+        }
       } catch {
-        // stream falls back to Innertube download
+        // stream falls back to Innertube download; high-res still needs client mux
+        needsMux = kind === 'video' && quality > 720
       }
+
       const token = signToken({
         platform: 'youtube',
         sourceUrl: url.toString(),
         kind,
         quality,
         mediaUrl,
+        audioUrl,
         mimeType,
+        audioMimeType,
         filename,
         title: meta.title,
+        needsMux,
       })
 
       sendJson(res, 200, {
@@ -94,6 +115,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         filename,
         token,
         needsEncode: hints.needsEncode,
+        needsMux,
+        actualQuality,
+        availableHeights,
       })
       return
     }
@@ -125,6 +149,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       isStory: ig.isStory,
       token,
       needsEncode: output === 'mp3',
+      needsMux: false,
+      availableHeights: [],
       note:
         'Instagram serves one rendered file — effects, captions, and audio are baked in as posted.',
     })

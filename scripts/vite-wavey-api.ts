@@ -19,7 +19,7 @@ import {
 } from '../api/_lib/validate.ts'
 import {
   downloadYoutubeStream,
-  pickYoutubeFormat,
+  pickYoutubeDelivery,
   resolveYoutube,
   youtubeOutputHints,
 } from '../api/_lib/youtube.ts'
@@ -108,25 +108,45 @@ async function handleResolve(req: IncomingMessage, res: ServerResponse) {
       const meta = await resolveYoutube(url.toString())
       const hints = youtubeOutputHints(meta, { kind, quality })
       let mediaUrl: string | undefined
+      let audioUrl: string | undefined
       let mimeType = hints.mimeType
+      let audioMimeType: string | undefined
       let filename = hints.filename
+      let needsMux = false
+      let actualQuality = quality
+      let availableHeights: number[] = []
+
       try {
-        const picked = await pickYoutubeFormat(url.toString(), { kind, quality })
-        mediaUrl = picked.mediaUrl
-        mimeType = picked.mimeType
-        filename = picked.filename
+        const delivery = await pickYoutubeDelivery(url.toString(), { kind, quality })
+        availableHeights = delivery.availableHeights
+        actualQuality = delivery.quality
+        filename = delivery.filename
+        if (delivery.mode === 'adaptive') {
+          // Don't embed long CDN URLs in the token (URL length limits). Stream re-picks.
+          mimeType = delivery.videoMime
+          audioMimeType = delivery.audioMime
+          needsMux = true
+        } else {
+          mediaUrl = delivery.mediaUrl
+          mimeType = delivery.mimeType
+          needsMux = false
+        }
       } catch {
-        // stream will use Innertube download()
+        needsMux = kind === 'video' && quality > 720
       }
+
       const token = signToken({
         platform: 'youtube',
         sourceUrl: url.toString(),
         kind,
         quality,
         mediaUrl,
+        audioUrl,
         mimeType,
+        audioMimeType,
         filename,
         title: meta.title,
+        needsMux,
       })
       sendJson(res, 200, {
         ok: true,
@@ -142,6 +162,9 @@ async function handleResolve(req: IncomingMessage, res: ServerResponse) {
         filename,
         token,
         needsEncode: hints.needsEncode,
+        needsMux,
+        actualQuality,
+        availableHeights,
       })
       return
     }
@@ -172,6 +195,8 @@ async function handleResolve(req: IncomingMessage, res: ServerResponse) {
       isStory: ig.isStory,
       token,
       needsEncode: output === 'mp3',
+      needsMux: false,
+      availableHeights: [],
       note: 'Instagram serves one rendered file — effects, captions, and audio are baked in as posted.',
     })
   } catch (err) {
@@ -199,6 +224,10 @@ async function handleStream(req: IncomingMessage, res: ServerResponse) {
       return
     }
 
+    const partRaw = (u.searchParams.get('part') || 'auto').toLowerCase()
+    const part: 'video' | 'audio' | 'auto' =
+      partRaw === 'audio' || partRaw === 'video' ? partRaw : 'auto'
+
     const payload = verifyToken(tokenParam)
     const ytHeaders = {
       'User-Agent':
@@ -209,27 +238,39 @@ async function handleStream(req: IncomingMessage, res: ServerResponse) {
     let buffer: Buffer | undefined
     let contentType = payload.mimeType || 'application/octet-stream'
     let filename = payload.filename
-
-    // Buffer fully first — chunked streaming through Vite often gets cut by browsers/extensions
     let mediaErr: unknown
-    if (payload.mediaUrl) {
+
+    const wantAudio =
+      part === 'audio' || (part === 'auto' && payload.kind === 'audio' && !payload.needsMux)
+
+    if (payload.platform === 'youtube' && payload.needsMux && part === 'auto') {
+      sendError(res, 400, 'Adaptive stream needs part=video or part=audio')
+      return
+    }
+
+    const directUrl = wantAudio ? payload.audioUrl || payload.mediaUrl : payload.mediaUrl
+    if (directUrl && !(payload.needsMux && part === 'auto')) {
       try {
-        const mediaUrl = assertAllowedMediaUrl(payload.mediaUrl)
+        const mediaUrl = assertAllowedMediaUrl(directUrl)
         const headers = payload.platform === 'instagram' ? igFetchHeaders() : ytHeaders
         const fetched = await fetchToBuffer(mediaUrl.toString(), headers)
         buffer = fetched.buffer
-        contentType = payload.mimeType || fetched.contentType
+        contentType =
+          (wantAudio ? payload.audioMimeType : payload.mimeType) || fetched.contentType
+        if (wantAudio && payload.needsMux) {
+          filename = payload.filename.replace(/\.mp4$/i, '.m4a')
+        }
       } catch (err) {
         mediaErr = err
         if (payload.platform !== 'youtube') throw err
-        // CDN URL expired / 403 — fall through to Innertube download
       }
     }
 
     if (!buffer && payload.platform === 'youtube') {
       const dl = await downloadYoutubeStream(payload.sourceUrl, {
-        kind: payload.kind,
+        kind: wantAudio ? 'audio' : payload.kind,
         quality: payload.quality,
+        part: payload.needsMux ? (wantAudio ? 'audio' : 'video') : part,
       })
       buffer = await streamToBuffer(dl.stream)
       contentType = dl.mimeType

@@ -42,6 +42,7 @@ import {
 } from '../api/_lib/validate.ts'
 import {
   downloadYoutubeStream,
+  pickYoutubeDelivery,
   resolveYoutube,
   youtubeOutputHints,
 } from '../api/_lib/youtube.ts'
@@ -133,14 +134,43 @@ async function handleResolve(req: http.IncomingMessage, res: http.ServerResponse
     if (platform === 'youtube') {
       const meta = await resolveYoutube(url.toString())
       const hints = youtubeOutputHints(meta, { kind, quality })
+      let mediaUrl: string | undefined
+      let mimeType = hints.mimeType
+      let audioMimeType: string | undefined
+      let filename = hints.filename
+      let needsMux = false
+      let actualQuality = quality
+      let availableHeights: number[] = []
+
+      try {
+        const delivery = await pickYoutubeDelivery(url.toString(), { kind, quality })
+        availableHeights = delivery.availableHeights
+        actualQuality = delivery.quality
+        filename = delivery.filename
+        if (delivery.mode === 'adaptive') {
+          mimeType = delivery.videoMime
+          audioMimeType = delivery.audioMime
+          needsMux = true
+        } else {
+          mediaUrl = delivery.mediaUrl
+          mimeType = delivery.mimeType
+          needsMux = false
+        }
+      } catch {
+        needsMux = kind === 'video' && quality > 720
+      }
+
       const token = signToken({
         platform: 'youtube',
         sourceUrl: url.toString(),
         kind,
         quality,
-        mimeType: hints.mimeType,
-        filename: hints.filename,
+        mediaUrl,
+        mimeType,
+        audioMimeType,
+        filename,
         title: meta.title,
+        needsMux,
       })
       sendJson(res, 200, {
         ok: true,
@@ -152,10 +182,13 @@ async function handleResolve(req: http.IncomingMessage, res: http.ServerResponse
         thumbUrl: meta.thumbUrl,
         thumbHue: meta.thumbHue,
         kindLabel: meta.kindLabel,
-        mimeType: hints.mimeType,
-        filename: hints.filename,
+        mimeType,
+        filename,
         token,
         needsEncode: hints.needsEncode,
+        needsMux,
+        actualQuality,
+        availableHeights,
       })
       return
     }
@@ -186,6 +219,8 @@ async function handleResolve(req: http.IncomingMessage, res: http.ServerResponse
       isStory: ig.isStory,
       token,
       needsEncode: output === 'mp3',
+      needsMux: false,
+      availableHeights: [],
       note: 'Instagram serves one rendered file — effects, captions, and audio are baked in as posted.',
     })
   } catch (err) {
@@ -209,16 +244,28 @@ async function handleStream(req: http.IncomingMessage, res: http.ServerResponse)
       return
     }
 
+    const partRaw = (u.searchParams.get('part') || 'auto').toLowerCase()
+    const part: 'video' | 'audio' | 'auto' =
+      partRaw === 'audio' || partRaw === 'video' ? partRaw : 'auto'
+
     const payload = verifyToken(tokenParam)
     for (const [k, v] of Object.entries(corsHeaders())) res.setHeader(k, v)
     res.setHeader('Cache-Control', 'no-store')
-    res.setHeader('Content-Disposition', contentDispositionAttachment(payload.filename))
+
+    const wantAudio =
+      part === 'audio' || (part === 'auto' && payload.kind === 'audio' && !payload.needsMux)
+
+    if (payload.platform === 'youtube' && payload.needsMux && part === 'auto') {
+      sendError(res, 400, 'Adaptive stream needs part=video or part=audio')
+      return
+    }
 
     if (payload.platform === 'youtube') {
       try {
         const dl = await downloadYoutubeStream(payload.sourceUrl, {
-          kind: payload.kind,
+          kind: wantAudio ? 'audio' : payload.kind,
           quality: payload.quality,
+          part: payload.needsMux ? (wantAudio ? 'audio' : 'video') : part,
         })
         res.writeHead(200, {
           'Content-Type': dl.mimeType,
@@ -233,12 +280,13 @@ async function handleStream(req: http.IncomingMessage, res: http.ServerResponse)
       }
     }
 
-    if (!payload.mediaUrl) {
+    const directUrl = wantAudio ? payload.audioUrl || payload.mediaUrl : payload.mediaUrl
+    if (!directUrl) {
       sendError(res, 400, 'No media URL in token — resolve again')
       return
     }
 
-    const mediaUrl = assertAllowedMediaUrl(payload.mediaUrl)
+    const mediaUrl = assertAllowedMediaUrl(directUrl)
     const headers: Record<string, string> =
       payload.platform === 'instagram'
         ? igFetchHeaders()
@@ -255,14 +303,18 @@ async function handleStream(req: http.IncomingMessage, res: http.ServerResponse)
     }
 
     const contentType =
-      payload.mimeType ||
+      (wantAudio ? payload.audioMimeType : payload.mimeType) ||
       upstream.headers.get('content-type') ||
       'application/octet-stream'
+    const filename =
+      wantAudio && payload.needsMux
+        ? payload.filename.replace(/\.mp4$/i, '.m4a')
+        : payload.filename
     const head: Record<string, string> = {
       'Content-Type': contentType,
       ...corsHeaders(),
       'Cache-Control': 'no-store',
-      'Content-Disposition': contentDispositionAttachment(payload.filename),
+      'Content-Disposition': contentDispositionAttachment(filename),
     }
     const len = upstream.headers.get('content-length')
     if (len) head['Content-Length'] = len
